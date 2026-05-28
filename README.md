@@ -41,24 +41,54 @@ cmake .. -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
 
 ## Transformation summary
 
-The pass replaces the following constructs:
+The pass introduces three function-local `alloca` slots in the entry block
+of every function it touches — an in-flight flag (`i1`), the thrown
+`type_info` pointer, and the thrown value pointer — and rewrites the
+following constructs in terms of those slots:
 
-| Original construct         | Replacement                                              |
-|----------------------------|----------------------------------------------------------|
-| `__cxa_allocate_exception` | `alloca` of the requested size                           |
-| `__cxa_free_exception`     | Removed (`alloca` self-frees)                            |
-| `__cxa_throw`              | Store error type / value to thread-local; return sentinel|
-| `__cxa_rethrow`            | Re-set in-flight flag; return sentinel                   |
-| `invoke`                   | `call` + load error flag + conditional branch            |
-| `landingpad`               | Build `{ ptr, i32 }` from thread-local typeinfo          |
-| `__cxa_begin_catch`        | Load thrown value; clear in-flight flag                  |
-| `__cxa_end_catch`          | Removed                                                  |
-| `resume`                   | Set in-flight flag; return sentinel                      |
-| `catchret`                 | Clear in-flight flag; unconditional branch to successor  |
-| `cleanupret`               | Branch to unwind destination, or return sentinel         |
-| `catchpad`                 | Load thrown value; clear in-flight flag                  |
-| `cleanuppad`               | Removed (cleanup body keeps the flag set)                |
-| `catchswitch`              | Branch to first handler / unwind / return sentinel       |
+| Original construct         | Replacement                                                      |
+|----------------------------|------------------------------------------------------------------|
+| `__cxa_allocate_exception` | `alloca` of the requested size                                   |
+| `__cxa_free_exception`     | Removed (`alloca` self-frees)                                    |
+| `__cxa_throw`              | Store error type / value to flag slots; return sentinel          |
+| `__cxa_rethrow`            | Re-set in-flight flag; return sentinel                           |
+| `_CxxThrowException`       | (MSVC) Store error type / value to flag slots; return sentinel   |
+| `invoke`                   | `call` + load error flag + conditional branch                    |
+| `landingpad`               | Build `{ ptr, i32 }` from the typeinfo slot                      |
+| `__cxa_begin_catch`        | Load thrown value; clear in-flight flag                          |
+| `__cxa_end_catch`          | Removed                                                          |
+| `resume`                   | Set in-flight flag; return sentinel                              |
+| `catchret`                 | Clear in-flight flag; unconditional branch to successor          |
+| `cleanupret`               | Branch to unwind destination, or return sentinel                 |
+| `catchpad`                 | Clear in-flight flag                                             |
+| `cleanuppad`               | Removed (cleanup body keeps the flag set)                        |
+| `catchswitch`              | Typed dispatch chain (`icmp eq` on each handler's type filter)   |
+| `[ "funclet"(...) ]` bundle| Stripped from every call / invoke (dead after funclet lowering)  |
+| `personality` attribute    | Cleared from every function the pass touches                     |
+
+### Notes for MSVC C++ EH
+
+* The three flag slots live as function-local `alloca`s rather than as
+  thread-local module globals so that downstream tools which do not
+  pre-allocate module globals (notably SAW's crucible-llvm) can execute
+  the lowered IR without any post-processing.
+* `_CxxThrowException(value, throw-info)` is rewritten in the same shape
+  as `__cxa_throw` — the throw-info pointer goes into the typeinfo slot,
+  the value pointer into the value slot, the in-flight flag is set, and
+  trailing `unreachable` (if any) is replaced with a sentinel `ret`.
+* `catchswitch` lowering emits a typed dispatch chain comparing the
+  in-flight typeinfo against each handler's catchpad type descriptor in
+  source order. A catchpad with a null type descriptor (`catch (...)`)
+  becomes an unconditional branch and shadows any later handlers. If no
+  handler matches, control flows to the catchswitch's unwind destination
+  (or to a synthesized sentinel-return block if it has none).
+* `"funclet"` operand bundles on calls that used to live inside a
+  catchpad / cleanuppad are stripped after funclet lowering. The parent
+  token they referenced has been replaced with `undef`, and the bundle
+  is rejected by SAW's `llvm-pretty-bc-parser`.
+* The MSVC `__CxxFrameHandler3` personality reference is cleared from
+  every function the pass touches, so the lowered module is self-
+  contained and does not require modelling the personality function.
 
 ## Testing
 

@@ -1,6 +1,7 @@
 #include "ExceptionLowerPass.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/IR/Constants.h"
@@ -20,66 +21,68 @@ namespace exclow {
 
 namespace {
 
-// Names for synthesized instructions and globals.
-constexpr StringRef kInFlightFlagName     = "__exclow_error_flag";
-constexpr StringRef kThrownTypeInfoName   = "__exclow_error_typeinfo";
-constexpr StringRef kThrownValuePtrName   = "__exclow_error_value";
-constexpr StringRef kEhCheckBlockSuffix   = ".ehcheck";
-constexpr StringRef kErrFlagLabel         = "exclow.err";
-constexpr StringRef kTypeInfoLabel        = "exclow.ti";
-constexpr StringRef kCaughtPtrLabel       = "exclow.caught";
-constexpr StringRef kExnAllocLabel        = "exclow.exn";
+// Names for synthesized slots and blocks.
+constexpr StringRef kInFlightFlagName       = "exclow.error.flag";
+constexpr StringRef kThrownTypeInfoName     = "exclow.error.typeinfo";
+constexpr StringRef kThrownValuePtrName     = "exclow.error.value";
+constexpr StringRef kEhCheckBlockSuffix     = ".ehcheck";
+constexpr StringRef kErrFlagLabel           = "exclow.err";
+constexpr StringRef kTypeInfoLabel          = "exclow.ti";
+constexpr StringRef kCaughtPtrLabel         = "exclow.caught";
+constexpr StringRef kExnAllocLabel          = "exclow.exn";
+constexpr StringRef kCatchMatchLabel        = "exclow.match";
+constexpr StringRef kCatchNextBlockName     = "exclow.catch.next";
+constexpr StringRef kUnhandledBlockName     = "exclow.unhandled";
+constexpr StringRef kCanonicalTypeDescPrefix = "__exclow.td.";
 
-// Thread-local globals representing "an exception is currently propagating".
-// Together these stand in for the unwinder ABI in lowered bitcode.
+// Per-function error-state slots. These live in `alloca`s in the entry block
+// (rather than thread-local globals) so that downstream tools that do not
+// pre-allocate module globals (e.g. SAW's crucible-llvm) can still execute
+// the lowered IR symbolically.
 struct ErrorState {
-  llvm::GlobalVariable *inFlightFlag;       // i1:  true while an exception is live
-  llvm::GlobalVariable *thrownTypeInfo;     // ptr: std::type_info of thrown object
-  llvm::GlobalVariable *thrownValuePtr;     // ptr: address of the thrown object
+  Value *inFlightFlag;    // pointer to i1
+  Value *thrownTypeInfo;  // pointer to ptr
+  Value *thrownValuePtr;  // pointer to ptr
 };
 
-llvm::GlobalVariable *getOrCreateThreadLocalGlobal(llvm::Module &Mod,
-                                                   StringRef GlobalName,
-                                                   llvm::Type *GlobalType) {
-  if (auto *Existing = Mod.getGlobalVariable(GlobalName))
-    return Existing;
+ErrorState createErrorState(Function &Func) {
+  LLVMContext &Ctx = Func.getContext();
+  BasicBlock &Entry = Func.getEntryBlock();
+  IRBuilder<> B(&Entry, Entry.getFirstInsertionPt());
 
-  auto *Global = new llvm::GlobalVariable(
-      Mod, GlobalType, /*isConstant=*/false, llvm::GlobalValue::InternalLinkage,
-      llvm::Constant::getNullValue(GlobalType), GlobalName);
-  Global->setThreadLocal(true);
-  return Global;
+  Type *BoolTy = Type::getInt1Ty(Ctx);
+  PointerType *PtrTy = PointerType::getUnqual(Ctx);
+
+  AllocaInst *Flag = B.CreateAlloca(BoolTy, nullptr, kInFlightFlagName);
+  AllocaInst *TI   = B.CreateAlloca(PtrTy,  nullptr, kThrownTypeInfoName);
+  AllocaInst *Val  = B.CreateAlloca(PtrTy,  nullptr, kThrownValuePtrName);
+
+  B.CreateStore(ConstantInt::getFalse(Ctx),       Flag);
+  B.CreateStore(ConstantPointerNull::get(PtrTy),  TI);
+  B.CreateStore(ConstantPointerNull::get(PtrTy),  Val);
+
+  return { Flag, TI, Val };
 }
 
-ErrorState getOrCreateErrorState(llvm::Module &Mod) {
-  auto &Ctx = Mod.getContext();
-  auto *BoolTy = llvm::Type::getInt1Ty(Ctx);
-  auto *PtrTy = llvm::PointerType::getUnqual(Ctx);
-  return {
-      getOrCreateThreadLocalGlobal(Mod, kInFlightFlagName,   BoolTy),
-      getOrCreateThreadLocalGlobal(Mod, kThrownTypeInfoName, PtrTy),
-      getOrCreateThreadLocalGlobal(Mod, kThrownValuePtrName, PtrTy),
-  };
-}
-
-// A "sentinel" return value used to propagate an error out of an unwinding path.
-// For booleans (i1), we use 'false' (null) rather than '-1' to avoid
-// accidentally returning 'true' (success) in boolean success-indicator fns.
-llvm::Value *makeSentinelReturnValue(llvm::Function &Func) {
-  llvm::Type *RetTy = Func.getReturnType();
+// A "sentinel" return value used when an exception escapes the function.
+// For booleans (i1) we use `false` (null) rather than `-1` so that we do not
+// accidentally return `true` (success) for boolean success-indicator
+// functions.
+Value *makeSentinelReturnValue(Function &Func) {
+  Type *RetTy = Func.getReturnType();
   if (RetTy->isVoidTy())
     return nullptr;
   if (RetTy->isFloatingPointTy())
-    return llvm::ConstantFP::getNaN(RetTy);
-  return llvm::Constant::getNullValue(RetTy);
+    return ConstantFP::getNaN(RetTy);
+  return Constant::getNullValue(RetTy);
 }
 
 // Emit "store true→InFlightFlag; ret <sentinel-or-void>" at Builder.
-void emitErrorReturn(llvm::IRBuilder<> &Builder, llvm::Function &Func,
+void emitErrorReturn(IRBuilder<> &Builder, Function &Func,
                      const ErrorState &State) {
-  Builder.CreateStore(llvm::ConstantInt::getTrue(Builder.getContext()),
+  Builder.CreateStore(ConstantInt::getTrue(Builder.getContext()),
                       State.inFlightFlag);
-  if (llvm::Value *Sentinel = makeSentinelReturnValue(Func))
+  if (Value *Sentinel = makeSentinelReturnValue(Func))
     Builder.CreateRet(Sentinel);
   else
     Builder.CreateRetVoid();
@@ -87,130 +90,201 @@ void emitErrorReturn(llvm::IRBuilder<> &Builder, llvm::Function &Func,
 
 // Clean up trailing dead code (typically an `unreachable`) after replacing
 // a no-return call with a synthesized `ret`.
-void eraseTrailingInstructions(llvm::Instruction *StartInst) {
-  llvm::BasicBlock *BB = StartInst->getParent();
+void eraseTrailingInstructions(Instruction *StartInst) {
+  BasicBlock *BB = StartInst->getParent();
   while (&BB->back() != StartInst) {
-    llvm::Instruction *Dead = &BB->back();
+    Instruction *Dead = &BB->back();
     if (!Dead->use_empty())
-      Dead->replaceAllUsesWith(llvm::UndefValue::get(Dead->getType()));
+      Dead->replaceAllUsesWith(UndefValue::get(Dead->getType()));
     Dead->eraseFromParent();
   }
 }
 
-// Replace `landingpad` with a synthetic `{ ptr, i32 }` built from the
-// thread-local typeinfo slot.
-void lowerLandingPadInPlace(llvm::LandingPadInst *LP, const ErrorState &State) {
-  auto &Ctx = LP->getContext();
-  llvm::IRBuilder<> Builder(LP);
-  llvm::Value *TI = Builder.CreateLoad(llvm::PointerType::getUnqual(Ctx),
-                                       State.thrownTypeInfo, kTypeInfoLabel);
-  llvm::Value *Res = llvm::UndefValue::get(LP->getType());
+// Replace a `landingpad` with a synthetic `{ ptr, i32 }` built from the
+// in-flight typeinfo slot.
+void lowerLandingPadInPlace(LandingPadInst *LP, const ErrorState &State) {
+  LLVMContext &Ctx = LP->getContext();
+  IRBuilder<> Builder(LP);
+  Value *TI = Builder.CreateLoad(PointerType::getUnqual(Ctx),
+                                 State.thrownTypeInfo, kTypeInfoLabel);
+  Value *Res = UndefValue::get(LP->getType());
   Res = Builder.CreateInsertValue(Res, TI, 0);
   Res = Builder.CreateInsertValue(
-      Res, llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), 0), 1);
+      Res, ConstantInt::get(Type::getInt32Ty(Ctx), 0), 1);
   LP->replaceAllUsesWith(Res);
   LP->eraseFromParent();
+}
+
+// ---------------------------------------------------------------------------
+// MSVC type-discriminator canonicalisation.
+//
+// Clang's MSVC-target lowering emits two *different* RTTI globals for the
+// "what type was thrown" question:
+//
+//   * Throw site: `_CxxThrowException(value, @"_TI<flags><mangled-tag>")` —
+//     a `%eh.ThrowInfo` struct that points (via `_CTA*` and `_CT*`) at the
+//     real type descriptor.
+//   * Catch site: `catchpad within %cs [ptr @"??_R0<mangled-tag>@8", ...]` —
+//     the actual `%rtti.TypeDescriptor`.
+//
+// Pointer-equality on the raw operands therefore *never* matches. To make
+// the typed dispatch work without running an MSVC RTTI interpreter at
+// verification time, we route both sides through a single canonical
+// per-type-tag symbol: `@__exclow.td.<mangled-tag>`. The canonical symbol
+// has `internal` linkage and a trivial initialiser — only its address is
+// meaningful, never its contents.
+//
+// As a bonus this also fixes the second SAW-side issue: the original
+// `??_R0` globals are emitted as `linkonce_odr` + `comdat` and crucible-
+// llvm declines to allocate them. The internal clone we substitute is the
+// `internal constant` linkage pattern that crucible-llvm accepts.
+
+// Strip `_TI<digits>` prefix from a throw-info global's name, returning
+// the trailing mangled type tag (e.g. `?AUHarmlessTag@@`, `H` for `int`).
+StringRef extractTagFromThrowInfo(StringRef Name) {
+  if (!Name.consume_front("_TI"))
+    return StringRef();
+  while (!Name.empty() && Name.front() >= '0' && Name.front() <= '9')
+    Name = Name.drop_front();
+  return Name;
+}
+
+// Strip `??_R0` prefix and `@8` suffix from a type-descriptor global's
+// name, returning the mangled type tag.
+StringRef extractTagFromTypeDescriptor(StringRef Name) {
+  if (!Name.consume_front("??_R0"))
+    return StringRef();
+  if (!Name.consume_back("@8"))
+    return StringRef();
+  return Name;
+}
+
+// Return the canonical per-type-tag global, creating it on first use.
+GlobalVariable *getOrCreateCanonicalTypeDescriptor(Module &Mod,
+                                                   StringRef Tag) {
+  SmallString<128> NameBuf;
+  NameBuf.append(kCanonicalTypeDescPrefix);
+  NameBuf.append(Tag);
+
+  if (auto *Existing = Mod.getNamedGlobal(NameBuf))
+    return Existing;
+
+  LLVMContext &Ctx = Mod.getContext();
+  Type *I8 = Type::getInt8Ty(Ctx);
+  auto *G = new GlobalVariable(Mod, I8,
+                               /*isConstant=*/true,
+                               GlobalValue::InternalLinkage,
+                               ConstantInt::get(I8, 0), NameBuf);
+  G->setAlignment(MaybeAlign(1));
+  G->setDSOLocal(true);
+  return G;
+}
+
+// Given a value that should denote "the thrown type" (the throw-info or
+// type-descriptor operand of a throw / catch site), return the canonical
+// per-tag global to use in its place. Returns the input unchanged if the
+// operand doesn't match the MSVC name patterns we recognise.
+Value *canonicaliseThrowInfo(Module &Mod, Value *Op) {
+  auto *Glob = dyn_cast<GlobalVariable>(Op->stripPointerCasts());
+  if (!Glob)
+    return Op;
+  StringRef Tag = extractTagFromThrowInfo(Glob->getName());
+  if (Tag.empty())
+    return Op;
+  return getOrCreateCanonicalTypeDescriptor(Mod, Tag);
+}
+
+Value *canonicaliseTypeDescriptor(Module &Mod, Value *Op) {
+  auto *Glob = dyn_cast<GlobalVariable>(Op->stripPointerCasts());
+  if (!Glob)
+    return Op;
+  StringRef Tag = extractTagFromTypeDescriptor(Glob->getName());
+  if (Tag.empty())
+    return Op;
+  return getOrCreateCanonicalTypeDescriptor(Mod, Tag);
 }
 
 enum class CxaRuntime {
   None,
   AllocateException,
   FreeException,
-  Throw,
-  Rethrow,
+  Throw,         // Itanium __cxa_throw
+  Rethrow,       // Itanium __cxa_rethrow
   BeginCatch,
   EndCatch,
+  CxxThrow,      // MSVC _CxxThrowException
 };
 
-CxaRuntime classifyCxaCall(const llvm::CallInst &Call) {
-  const llvm::Function *Callee = Call.getCalledFunction();
+CxaRuntime classifyCxa(const Function *Callee) {
   if (!Callee)
     return CxaRuntime::None;
-  return llvm::StringSwitch<CxaRuntime>(Callee->getName())
+  return StringSwitch<CxaRuntime>(Callee->getName())
       .Case("__cxa_allocate_exception", CxaRuntime::AllocateException)
       .Case("__cxa_free_exception",     CxaRuntime::FreeException)
       .Case("__cxa_throw",              CxaRuntime::Throw)
       .Case("__cxa_rethrow",            CxaRuntime::Rethrow)
       .Case("__cxa_begin_catch",        CxaRuntime::BeginCatch)
       .Case("__cxa_end_catch",          CxaRuntime::EndCatch)
+      .Case("_CxxThrowException",       CxaRuntime::CxxThrow)
       .Default(CxaRuntime::None);
 }
 
-// Collector for all instructions that need lowering.
-struct LoweringWorklist : llvm::InstVisitor<LoweringWorklist> {
-  llvm::SmallVector<llvm::InvokeInst *, 8> Invokes;
-  llvm::SmallVector<llvm::ResumeInst *, 4> Resumes;
-  llvm::SmallVector<llvm::CallInst *, 8>   CxaCalls;
-  llvm::SmallVector<llvm::CatchReturnInst *, 4>   CatchReturns;
-  llvm::SmallVector<llvm::CleanupReturnInst *, 4> CleanupReturns;
-  llvm::SmallVector<llvm::CatchPadInst *, 4>      CatchPads;
-  llvm::SmallVector<llvm::CleanupPadInst *, 4>    CleanupPads;
-  llvm::SmallVector<llvm::CatchSwitchInst *, 4>   CatchSwitches;
-
-  void visitInvokeInst(llvm::InvokeInst &I) { Invokes.push_back(&I); }
-  void visitResumeInst(llvm::ResumeInst &I) { Resumes.push_back(&I); }
-  void visitCallInst(llvm::CallInst &I) {
-    if (classifyCxaCall(I) != CxaRuntime::None)
-      CxaCalls.push_back(&I);
-  }
-  void visitCatchReturnInst(llvm::CatchReturnInst &I)     { CatchReturns.push_back(&I); }
-  void visitCleanupReturnInst(llvm::CleanupReturnInst &I) { CleanupReturns.push_back(&I); }
-  void visitCatchPadInst(llvm::CatchPadInst &I)           { CatchPads.push_back(&I); }
-  void visitCleanupPadInst(llvm::CleanupPadInst &I)       { CleanupPads.push_back(&I); }
-  void visitCatchSwitchInst(llvm::CatchSwitchInst &I)     { CatchSwitches.push_back(&I); }
-
-  bool empty() const {
-    return Invokes.empty() && Resumes.empty() && CxaCalls.empty() &&
-           CatchReturns.empty() && CleanupReturns.empty() &&
-           CatchPads.empty() && CleanupPads.empty() && CatchSwitches.empty();
-  }
-};
-
-void lowerInvoke(llvm::InvokeInst *Invoke, const ErrorState &State) {
-  auto &Ctx = Invoke->getContext();
-  llvm::BasicBlock *NormalDest = Invoke->getNormalDest();
-  llvm::BasicBlock *UnwindDest = Invoke->getUnwindDest();
-  llvm::BasicBlock *InvokeBB   = Invoke->getParent();
-  llvm::Function *Func         = InvokeBB->getParent();
-
-  llvm::BasicBlock *EHBlock = llvm::BasicBlock::Create(
-      Ctx, InvokeBB->getName() + kEhCheckBlockSuffix, Func, NormalDest);
-
-  llvm::IRBuilder<> Builder(Invoke);
-  llvm::SmallVector<llvm::Value *, 8> Args(Invoke->args());
-  llvm::SmallVector<llvm::OperandBundleDef, 2> Bundles;
-  Invoke->getOperandBundlesAsDefs(Bundles);
-
-  llvm::CallInst *Call = Builder.CreateCall(Invoke->getFunctionType(),
-                                            Invoke->getCalledOperand(), Args,
-                                            Bundles);
-  Call->setCallingConv(Invoke->getCallingConv());
-  Call->setAttributes(Invoke->getAttributes());
-  if (!Invoke->getType()->isVoidTy())
-    Invoke->replaceAllUsesWith(Call);
-  Builder.CreateBr(EHBlock);
-
-  llvm::IRBuilder<> EHBuilder(EHBlock);
-  llvm::Value *InFlight = EHBuilder.CreateLoad(
-      llvm::Type::getInt1Ty(Ctx), State.inFlightFlag, kErrFlagLabel);
-  EHBuilder.CreateCondBr(InFlight, UnwindDest, NormalDest);
-
-  Invoke->eraseFromParent();
-
-  if (auto *LP = llvm::dyn_cast<llvm::LandingPadInst>(&UnwindDest->front()))
-    lowerLandingPadInPlace(LP, State);
+bool isThrowKind(CxaRuntime K) {
+  return K == CxaRuntime::Throw || K == CxaRuntime::Rethrow ||
+         K == CxaRuntime::CxxThrow;
 }
 
-void lowerCxaCall(llvm::CallInst *Call, const ErrorState &State) {
-  auto &Ctx = Call->getContext();
-  llvm::Function *Func = Call->getFunction();
+// Lower a throw-like call site.
+//
+// All throw-like calls publish "exception in flight" to the error-state
+// slots. If the throw is followed by `unreachable` (so the throw escapes
+// the function), we additionally emit a sentinel `ret`. If the throw is
+// followed by a normal terminator — typically a `br %.ehcheck` left behind
+// when an earlier `invoke` of the throw runtime was demoted — we leave that
+// terminator alone so the caller's flag-check picks up the in-flight state.
+void lowerThrowCall(CallInst *Call, const ErrorState &State) {
+  Function *Func = Call->getFunction();
+  LLVMContext &Ctx = Call->getContext();
+  IRBuilder<> B(Call);
 
-  switch (classifyCxaCall(*Call)) {
+  CxaRuntime K = classifyCxa(Call->getCalledFunction());
+  if (K == CxaRuntime::Throw) {
+    // __cxa_throw(value, typeinfo, dtor). The Itanium typeinfo pointer is
+    // already the same global the matching landingpad clause / typeid.for
+    // intrinsic see, so no remapping is required.
+    B.CreateStore(Call->getArgOperand(1), State.thrownTypeInfo);
+    B.CreateStore(Call->getArgOperand(0), State.thrownValuePtr);
+  } else if (K == CxaRuntime::CxxThrow) {
+    // _CxxThrowException(value, throw-info). The throw-info global is a
+    // different RTTI symbol from the catchpad's type descriptor; route
+    // both sides through a canonical per-type-tag symbol so the typed
+    // dispatch's `icmp eq` can actually match.
+    Value *TIArg = canonicaliseThrowInfo(*Func->getParent(),
+                                         Call->getArgOperand(1));
+    B.CreateStore(TIArg, State.thrownTypeInfo);
+    B.CreateStore(Call->getArgOperand(0), State.thrownValuePtr);
+  }
+  // For Rethrow the slots already hold the in-flight values.
+  B.CreateStore(ConstantInt::getTrue(Ctx), State.inFlightFlag);
+
+  Instruction *Next = Call->getNextNode();
+  if (Next && isa<UnreachableInst>(Next)) {
+    emitErrorReturn(B, *Func, State);
+    eraseTrailingInstructions(Call);
+  }
+  Call->eraseFromParent();
+}
+
+// Lower the non-throw flavors of the Itanium runtime.
+void lowerCxaCall(CallInst *Call, const ErrorState &State) {
+  LLVMContext &Ctx = Call->getContext();
+
+  switch (classifyCxa(Call->getCalledFunction())) {
   case CxaRuntime::AllocateException: {
-    llvm::IRBuilder<> Builder(Call);
-    llvm::Value *Size = Call->getArgOperand(0);
-    llvm::Value *Alloca = Builder.CreateAlloca(llvm::Type::getInt8Ty(Ctx), Size,
-                                               kExnAllocLabel);
+    IRBuilder<> Builder(Call);
+    Value *Size = Call->getArgOperand(0);
+    Value *Alloca = Builder.CreateAlloca(Type::getInt8Ty(Ctx), Size,
+                                         kExnAllocLabel);
     Call->replaceAllUsesWith(Alloca);
     Call->eraseFromParent();
     break;
@@ -219,27 +293,11 @@ void lowerCxaCall(llvm::CallInst *Call, const ErrorState &State) {
   case CxaRuntime::EndCatch:
     Call->eraseFromParent();
     break;
-  case CxaRuntime::Throw: {
-    llvm::IRBuilder<> Builder(Call);
-    Builder.CreateStore(Call->getArgOperand(1), State.thrownTypeInfo);
-    Builder.CreateStore(Call->getArgOperand(0), State.thrownValuePtr);
-    emitErrorReturn(Builder, *Func, State);
-    eraseTrailingInstructions(Call);
-    Call->eraseFromParent();
-    break;
-  }
-  case CxaRuntime::Rethrow: {
-    llvm::IRBuilder<> Builder(Call);
-    emitErrorReturn(Builder, *Func, State);
-    eraseTrailingInstructions(Call);
-    Call->eraseFromParent();
-    break;
-  }
   case CxaRuntime::BeginCatch: {
-    llvm::IRBuilder<> Builder(Call);
-    llvm::Value *Caught = Builder.CreateLoad(llvm::PointerType::getUnqual(Ctx),
-                                             State.thrownValuePtr, kCaughtPtrLabel);
-    Builder.CreateStore(llvm::ConstantInt::getFalse(Ctx), State.inFlightFlag);
+    IRBuilder<> Builder(Call);
+    Value *Caught = Builder.CreateLoad(PointerType::getUnqual(Ctx),
+                                       State.thrownValuePtr, kCaughtPtrLabel);
+    Builder.CreateStore(ConstantInt::getFalse(Ctx), State.inFlightFlag);
     Call->replaceAllUsesWith(Caught);
     Call->eraseFromParent();
     break;
@@ -249,84 +307,380 @@ void lowerCxaCall(llvm::CallInst *Call, const ErrorState &State) {
   }
 }
 
-bool lowerFunction(llvm::Function &Func, const ErrorState &State) {
-  LoweringWorklist WL;
-  WL.visit(Func);
-  if (WL.empty())
-    return false;
+void lowerInvoke(InvokeInst *Invoke, const ErrorState &State) {
+  LLVMContext &Ctx = Invoke->getContext();
+  BasicBlock *NormalDest = Invoke->getNormalDest();
+  BasicBlock *UnwindDest = Invoke->getUnwindDest();
+  BasicBlock *InvokeBB   = Invoke->getParent();
+  Function *Func         = InvokeBB->getParent();
 
-  // 1. Lower Itanium runtime calls.
-  for (llvm::CallInst *Call : WL.CxaCalls) {
-    if (Call->getParent()) // Might have been erased by a preceding throw.
-      lowerCxaCall(Call, State);
+  BasicBlock *EHBlock = BasicBlock::Create(
+      Ctx, InvokeBB->getName() + kEhCheckBlockSuffix, Func, NormalDest);
+
+  IRBuilder<> Builder(Invoke);
+  SmallVector<Value *, 8> Args(Invoke->args());
+  SmallVector<OperandBundleDef, 2> Bundles;
+  Invoke->getOperandBundlesAsDefs(Bundles);
+
+  CallInst *Call = Builder.CreateCall(Invoke->getFunctionType(),
+                                      Invoke->getCalledOperand(), Args,
+                                      Bundles);
+  Call->setCallingConv(Invoke->getCallingConv());
+  Call->setAttributes(Invoke->getAttributes());
+  if (!Invoke->getType()->isVoidTy())
+    Invoke->replaceAllUsesWith(Call);
+  Builder.CreateBr(EHBlock);
+
+  IRBuilder<> EHBuilder(EHBlock);
+  Value *InFlight = EHBuilder.CreateLoad(Type::getInt1Ty(Ctx),
+                                         State.inFlightFlag, kErrFlagLabel);
+  EHBuilder.CreateCondBr(InFlight, UnwindDest, NormalDest);
+
+  Invoke->eraseFromParent();
+
+  if (auto *LP = dyn_cast<LandingPadInst>(&UnwindDest->front()))
+    lowerLandingPadInPlace(LP, State);
+}
+
+// Strip `"funclet"` operand bundles from every call / invoke in the function.
+//
+// After funclet lowering, the parent catchpad / cleanuppad token has been
+// replaced with `undef`, but every call that lived inside the funclet still
+// carries an `[ "funclet"(token undef) ]` annotation on the call itself.
+// SAW's bitcode parser does not yet decode FUNC_CODE_OPERAND_BUNDLE and
+// rejects the module on first encounter. Drop the bundles to keep the
+// output portable.
+void stripFuncletBundles(Function &Func) {
+  SmallVector<CallBase *, 16> ToRewrite;
+  for (BasicBlock &BB : Func) {
+    for (Instruction &I : BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      for (unsigned i = 0, e = CB->getNumOperandBundles(); i < e; ++i) {
+        if (CB->getOperandBundleAt(i).getTagName() == "funclet") {
+          ToRewrite.push_back(CB);
+          break;
+        }
+      }
+    }
+  }
+  for (CallBase *CB : ToRewrite) {
+    SmallVector<OperandBundleDef, 2> Keep;
+    for (unsigned i = 0, e = CB->getNumOperandBundles(); i < e; ++i) {
+      OperandBundleUse OB = CB->getOperandBundleAt(i);
+      if (OB.getTagName() != "funclet")
+        Keep.emplace_back(OB);
+    }
+    CallBase *NewCB = CallBase::Create(CB, Keep, CB);
+    NewCB->takeName(CB);
+    if (!CB->use_empty())
+      CB->replaceAllUsesWith(NewCB);
+    CB->eraseFromParent();
+  }
+}
+
+struct LoweringWorklist : InstVisitor<LoweringWorklist> {
+  SmallVector<InvokeInst *, 8>        Invokes;
+  SmallVector<ResumeInst *, 4>        Resumes;
+  SmallVector<CallInst *, 8>          CxaCalls; // non-throw flavors
+  SmallVector<CatchReturnInst *, 4>   CatchReturns;
+  SmallVector<CleanupReturnInst *, 4> CleanupReturns;
+  SmallVector<CatchPadInst *, 4>      CatchPads;
+  SmallVector<CleanupPadInst *, 4>    CleanupPads;
+  SmallVector<CatchSwitchInst *, 4>   CatchSwitches;
+
+  void visitInvokeInst(InvokeInst &I)             { Invokes.push_back(&I); }
+  void visitResumeInst(ResumeInst &I)             { Resumes.push_back(&I); }
+  void visitCallInst(CallInst &I) {
+    CxaRuntime K = classifyCxa(I.getCalledFunction());
+    // Throw-like calls are picked up by a separate post-invoke-lowering scan
+    // so that invokes-of-throw-runtimes (common in MSVC `try` blocks) get
+    // their resulting `call` processed too.
+    if (K != CxaRuntime::None && !isThrowKind(K))
+      CxaCalls.push_back(&I);
+  }
+  void visitCatchReturnInst(CatchReturnInst &I)     { CatchReturns.push_back(&I); }
+  void visitCleanupReturnInst(CleanupReturnInst &I) { CleanupReturns.push_back(&I); }
+  void visitCatchPadInst(CatchPadInst &I)           { CatchPads.push_back(&I); }
+  void visitCleanupPadInst(CleanupPadInst &I)       { CleanupPads.push_back(&I); }
+  void visitCatchSwitchInst(CatchSwitchInst &I)     { CatchSwitches.push_back(&I); }
+
+  bool empty() const {
+    return Invokes.empty() && Resumes.empty() && CxaCalls.empty() &&
+           CatchReturns.empty() && CleanupReturns.empty() &&
+           CatchPads.empty() && CleanupPads.empty() && CatchSwitches.empty();
+  }
+};
+
+// Quick check: does the function contain anything for the pass to lower?
+bool functionHasEHWork(Function &Func) {
+  for (BasicBlock &BB : Func) {
+    for (Instruction &I : BB) {
+      if (isa<InvokeInst>(&I)        || isa<ResumeInst>(&I)        ||
+          isa<CatchReturnInst>(&I)   || isa<CleanupReturnInst>(&I) ||
+          isa<CatchPadInst>(&I)      || isa<CleanupPadInst>(&I)    ||
+          isa<CatchSwitchInst>(&I)   || isa<LandingPadInst>(&I))
+        return true;
+      if (auto *C = dyn_cast<CallInst>(&I))
+        if (classifyCxa(C->getCalledFunction()) != CxaRuntime::None)
+          return true;
+    }
+  }
+  return false;
+}
+
+// Collect throw-like calls. Re-scanned after invoke lowering so that
+// invokes-of-throw-runtimes get their demoted `call` picked up.
+SmallVector<CallInst *, 8> collectThrowCalls(Function &Func) {
+  SmallVector<CallInst *, 8> Out;
+  for (BasicBlock &BB : Func) {
+    for (Instruction &I : BB) {
+      auto *C = dyn_cast<CallInst>(&I);
+      if (!C)
+        continue;
+      if (isThrowKind(classifyCxa(C->getCalledFunction())))
+        Out.push_back(C);
+    }
+  }
+  return Out;
+}
+
+// Snapshot of a catchswitch and its per-handler type filters. Captured
+// while catchpads are still alive so the catchpad's first argument (the
+// type descriptor) can be read.
+struct CatchSwitchSnapshot {
+  CatchSwitchInst *Switch;
+  // For each handler: (handler-block, type-descriptor or nullptr for catch-all).
+  SmallVector<std::pair<BasicBlock *, Value *>, 4> Handlers;
+};
+
+SmallVector<CatchSwitchSnapshot, 4>
+snapshotCatchSwitches(ArrayRef<CatchSwitchInst *> Switches) {
+  SmallVector<CatchSwitchSnapshot, 4> Out;
+  for (CatchSwitchInst *S : Switches) {
+    Module &Mod = *S->getFunction()->getParent();
+    CatchSwitchSnapshot Snap;
+    Snap.Switch = S;
+    for (auto It = S->handler_begin(); It != S->handler_end(); ++It) {
+      BasicBlock *H = *It;
+      Value *TD = nullptr;
+      if (auto *CP = dyn_cast<CatchPadInst>(&H->front())) {
+        if (CP->arg_size() > 0) {
+          Value *Op0 = CP->getArgOperand(0);
+          // MSVC encodes `catch (...)` with a null type descriptor.
+          if (!isa<ConstantPointerNull>(Op0))
+            TD = canonicaliseTypeDescriptor(Mod, Op0);
+        }
+      }
+      Snap.Handlers.push_back({H, TD});
+    }
+    Out.push_back(std::move(Snap));
+  }
+  return Out;
+}
+
+// Lower a catchswitch to a typed dispatch chain:
+//
+//   %ti = load ptr, ptr %typeinfo_slot
+//   %m0 = icmp eq ptr %ti, @TypeDescriptor0
+//   br i1 %m0, label %handler0, label %try1
+//   try1:
+//   %m1 = icmp eq ptr %ti, @TypeDescriptor1
+//   br i1 %m1, label %handler1, label %unhandled
+//
+// A handler with a null type descriptor (i.e. `catch (...)`) becomes an
+// unconditional branch and shadows any later handlers (matching C++'s
+// in-order dispatch).
+//
+// "Unhandled" branches to the catchswitch's unwind destination if it has
+// one, otherwise to a freshly-synthesized block that calls emitErrorReturn.
+void lowerCatchSwitch(const CatchSwitchSnapshot &Snap, Function &Func,
+                      const ErrorState &State) {
+  CatchSwitchInst *S = Snap.Switch;
+  LLVMContext &Ctx = S->getContext();
+  IRBuilder<> B(S);
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+
+  BasicBlock *Unhandled = nullptr;
+  if (S->hasUnwindDest())
+    Unhandled = S->getUnwindDest();
+
+  auto ensureUnhandled = [&]() {
+    if (Unhandled)
+      return;
+    Unhandled = BasicBlock::Create(Ctx, kUnhandledBlockName, &Func);
+    IRBuilder<> UB(Unhandled);
+    emitErrorReturn(UB, Func, State);
+  };
+
+  if (Snap.Handlers.empty()) {
+    ensureUnhandled();
+    B.CreateBr(Unhandled);
+    S->eraseFromParent();
+    return;
   }
 
-  // 2. Lower Invokes (transforms CFG).
-  for (llvm::InvokeInst *Invoke : WL.Invokes)
+  Value *TI = B.CreateLoad(PtrTy, State.thrownTypeInfo, kTypeInfoLabel);
+
+  for (size_t i = 0, n = Snap.Handlers.size(); i < n; ++i) {
+    BasicBlock *H = Snap.Handlers[i].first;
+    Value *TD    = Snap.Handlers[i].second;
+
+    // catch-all: unconditional branch, subsequent arms unreachable.
+    if (!TD) {
+      B.CreateBr(H);
+      S->eraseFromParent();
+      return;
+    }
+
+    Value *Match = B.CreateICmpEQ(TI, TD, kCatchMatchLabel);
+    bool isLast = (i + 1 == n);
+    if (isLast) {
+      ensureUnhandled();
+      B.CreateCondBr(Match, H, Unhandled);
+    } else {
+      BasicBlock *Next =
+          BasicBlock::Create(Ctx, kCatchNextBlockName, &Func);
+      B.CreateCondBr(Match, H, Next);
+      B.SetInsertPoint(Next);
+    }
+  }
+
+  S->eraseFromParent();
+}
+
+bool lowerFunction(Function &Func) {
+  if (!functionHasEHWork(Func))
+    return false;
+
+  ErrorState State = createErrorState(Func);
+
+  LoweringWorklist WL;
+  WL.visit(Func);
+
+  // 1. Capture catchswitch handler info while catchpads are still alive.
+  auto Snapshots = snapshotCatchSwitches(WL.CatchSwitches);
+
+  // 2. Lower non-throw Itanium runtime calls.
+  for (CallInst *Call : WL.CxaCalls)
+    if (Call->getParent())
+      lowerCxaCall(Call, State);
+
+  // 3. Lower Invokes (transforms CFG, may demote throw-invokes into calls).
+  for (InvokeInst *Invoke : WL.Invokes)
     lowerInvoke(Invoke, State);
 
-  // 3. Lower Resumes.
-  for (llvm::ResumeInst *Resume : WL.Resumes) {
-    llvm::IRBuilder<> Builder(Resume);
+  // 4. Lower throw-like calls — both __cxa_throw / __cxa_rethrow and the
+  //    MSVC counterpart _CxxThrowException — AFTER invoke lowering, so
+  //    previously-Invoke throw sites get their demoted `call` rewritten.
+  for (CallInst *Call : collectThrowCalls(Func))
+    lowerThrowCall(Call, State);
+
+  // 5. Lower Resumes.
+  for (ResumeInst *Resume : WL.Resumes) {
+    IRBuilder<> Builder(Resume);
     emitErrorReturn(Builder, Func, State);
     Resume->eraseFromParent();
   }
 
-  // 4. Lower SEH Funclets.
+  // 6. Lower SEH funclet edges (catchret / cleanupret). Done before
+  //    catchpad/cleanuppad erasure so the funclet-edge instructions can
+  //    still reach their parent pad.
   for (auto *R : WL.CatchReturns) {
-    llvm::IRBuilder<> B(R);
-    B.CreateStore(llvm::ConstantInt::getFalse(B.getContext()), State.inFlightFlag);
+    IRBuilder<> B(R);
+    B.CreateStore(ConstantInt::getFalse(B.getContext()), State.inFlightFlag);
     B.CreateBr(R->getSuccessor());
     R->eraseFromParent();
   }
   for (auto *R : WL.CleanupReturns) {
-    llvm::IRBuilder<> B(R);
+    IRBuilder<> B(R);
     if (R->hasUnwindDest())
       B.CreateBr(R->getUnwindDest());
     else
       emitErrorReturn(B, Func, State);
     R->eraseFromParent();
   }
+
+  // 7. Lower catchpads / cleanuppads. Must happen before catchswitch
+  //    erasure so the catchswitch's token-typed uses are dropped.
   for (auto *P : WL.CatchPads) {
-    llvm::IRBuilder<> B(P);
-    B.CreateStore(llvm::ConstantInt::getFalse(B.getContext()), State.inFlightFlag);
+    IRBuilder<> B(P);
+    B.CreateStore(ConstantInt::getFalse(B.getContext()), State.inFlightFlag);
     if (!P->use_empty())
-      P->replaceAllUsesWith(llvm::UndefValue::get(P->getType()));
+      P->replaceAllUsesWith(UndefValue::get(P->getType()));
     P->eraseFromParent();
   }
   for (auto *P : WL.CleanupPads) {
     if (!P->use_empty())
-      P->replaceAllUsesWith(llvm::UndefValue::get(P->getType()));
+      P->replaceAllUsesWith(UndefValue::get(P->getType()));
     P->eraseFromParent();
   }
-  for (auto *S : WL.CatchSwitches) {
-    llvm::IRBuilder<> B(S);
-    if (S->getNumHandlers() > 0)
-      B.CreateBr(*S->handler_begin()); // Note: Assumes type-dispatch is handled.
-    else if (S->hasUnwindDest())
-      B.CreateBr(S->getUnwindDest());
-    else
-      emitErrorReturn(B, Func, State);
-    S->eraseFromParent();
-  }
+
+  // 8. Lower catchswitches with typed dispatch using the captured snapshot.
+  for (const auto &Snap : Snapshots)
+    lowerCatchSwitch(Snap, Func, State);
+
+  // 9. Drop the function's personality attribute. Catchpads / landingpads
+  //    are gone, so the personality function reference is dead — and on
+  //    MSVC it's an external `declare` for `__CxxFrameHandler3` that
+  //    downstream tools would otherwise have to model.
+  if (Func.hasPersonalityFn())
+    Func.setPersonalityFn(nullptr);
+
+  // 10. Strip leftover `"funclet"(...)` operand bundles on calls that used
+  //     to live inside a funclet. SAW's bitcode parser does not yet decode
+  //     FUNC_CODE_OPERAND_BUNDLE; without this, the lowered module fails
+  //     to load.
+  stripFuncletBundles(Func);
 
   return true;
 }
 
 } // namespace
 
-llvm::PreservedAnalyses ExceptionLowerPass::run(llvm::Module &Mod,
-                                                llvm::ModuleAnalysisManager &) {
-  const ErrorState State = getOrCreateErrorState(Mod);
+PreservedAnalyses ExceptionLowerPass::run(Module &Mod,
+                                          ModuleAnalysisManager &) {
   bool Changed = false;
-
-  for (llvm::Function &Func : Mod) {
-    if (!Func.isDeclaration())
-      Changed |= lowerFunction(Func, State);
+  for (Function &Func : Mod) {
+    if (Func.isDeclaration())
+      continue;
+    Changed |= lowerFunction(Func);
   }
 
-  return Changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all();
+  // After lowering, none of the EH-runtime declarations or the personality
+  // function declarations are referenced. Erase the dead ones so the lowered
+  // module doesn't drag along external symbols downstream tools would have
+  // to model.
+  if (Changed) {
+    static constexpr StringRef DeadDeclNames[] = {
+        "_CxxThrowException",
+        "__cxa_throw",
+        "__cxa_rethrow",
+        "__cxa_allocate_exception",
+        "__cxa_free_exception",
+        "__cxa_begin_catch",
+        "__cxa_end_catch",
+        "__CxxFrameHandler3",
+        "__gxx_personality_v0",
+    };
+    SmallVector<Function *, 4> DeadDecls;
+    for (Function &F : Mod) {
+      if (!F.isDeclaration() || !F.use_empty())
+        continue;
+      StringRef N = F.getName();
+      for (StringRef D : DeadDeclNames) {
+        if (N == D) {
+          DeadDecls.push_back(&F);
+          break;
+        }
+      }
+    }
+    for (Function *F : DeadDecls)
+      F->eraseFromParent();
+  }
+
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
 } // namespace exclow
-
