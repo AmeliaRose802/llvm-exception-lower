@@ -104,6 +104,16 @@ Run the whole suite from the repo root:
 pwsh tests/run.ps1
 ```
 
+On Linux (or any POSIX shell) use the bash companion:
+
+```bash
+./tests/run.sh
+```
+
+Both runners share the same fixtures and apply the same embedded
+CHECK directives. Verified against LLVM 20 (Windows binary release)
+and LLVM 18 (Ubuntu 24.04 `llvm-18-dev` / `clang-18`).
+
 The runner, for each fixture:
 
 1. Compiles the source to LLVM bitcode (Windows-MSVC EH by default,
@@ -124,8 +134,13 @@ Filter to a single fixture by basename glob:
 pwsh tests/run.ps1 -Filter add_one_multi*
 ```
 
-Tool locations are auto-detected; override with `-LlvmBin`, `-ExcLow`,
-`$env:LLVM_BIN`, or `$env:EXCLOW_BIN`.
+```bash
+./tests/run.sh 'add_one_multi*'
+```
+
+Tool locations are auto-detected; override with `-LlvmBin` / `-ExcLow` /
+`$env:LLVM_BIN` / `$env:EXCLOW_BIN` (PowerShell) or `CLANGXX` / `OPT` /
+`LLVM_DIS` / `EXCLOW_BIN` env vars (bash).
 
 For a quick one-off run against an arbitrary source file:
 

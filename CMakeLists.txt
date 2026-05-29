@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(exception-lower LANGUAGES CXX)
+# C is needed because some LLVM distributions' CMake configs (e.g. Ubuntu's
+# llvm-18-dev) run check_c_source_compiles probes from their LLVMConfig.cmake
+# (FindFFI, FindTerminfo, ...) which fail unless the C language is enabled.
+project(exception-lower LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

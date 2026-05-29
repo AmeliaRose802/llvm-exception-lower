@@ -19,7 +19,9 @@ extern "C" unsigned add_one(unsigned x) {
 // CHECK-LABEL: define dso_local i32 @add_one(
 // CHECK:       %exclow.error.flag = alloca i1
 // CHECK:       store ptr @_ZTIi, ptr %exclow.error.typeinfo
-// CHECK-DAG:   call i32 @llvm.eh.typeid.for.p0(ptr @_ZTIi)
+// LLVM 18 emits `@llvm.eh.typeid.for(ptr ...)`; LLVM 20+ emits the type-
+// overloaded `@llvm.eh.typeid.for.p0(ptr ...)`. Match both via prefix.
+// CHECK-DAG:   call i32 @llvm.eh.typeid.for
 // CHECK-DAG:   load ptr, ptr %exclow.error.typeinfo
 //
 // CHECK-NOT:   landingpad

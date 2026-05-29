@@ -1,11 +1,15 @@
 // Single try / catch (int). Falls through; spec add_one(x) == x + 1 still SAT.
-#include <cstdio>
+//
+// `printf` is forward-declared rather than included via <cstdio> so the
+// fixture cross-compiles for `-target x86_64-pc-windows-msvc` from a Linux
+// host (where MSVC headers are not on the include path).
+extern "C" int printf(const char *, ...);
 
 extern "C" unsigned add_one(unsigned x) {
     try {
         if (x == 42u) throw 1;
     } catch (int e) {
-        std::printf("caught %d\n", e);
+        printf("caught %d\n", e);
     }
     return x + 1;
 }
