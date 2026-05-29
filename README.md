@@ -92,8 +92,42 @@ following constructs in terms of those slots:
 
 ## Testing
 
-Compile any C++ source to bitcode, run the pass, and disassemble to
-inspect the result:
+The [tests/](tests/) directory contains a small fixture suite plus a
+PowerShell runner. Each fixture is a single C++ translation unit that
+defines `extern "C" unsigned add_one(unsigned)` and embeds expected
+post-lowering shape as `// CHECK:` / `// CHECK-LABEL:` / `// CHECK-NOT:`
+/ `// CHECK-DAG:` comments at the bottom of the source.
+
+Run the whole suite from the repo root:
+
+```powershell
+pwsh tests/run.ps1
+```
+
+The runner, for each fixture:
+
+1. Compiles the source to LLVM bitcode (Windows-MSVC EH by default,
+   `x86_64-pc-linux-gnu` Itanium EH for fixtures named `itanium_*`).
+2. Runs `exception-lower.exe` on the bitcode.
+3. Disassembles the lowered bitcode to text IR.
+4. Runs `opt -passes=verify` on the lowered bitcode.
+5. Verifies the lowered text IR satisfies the embedded CHECK directives.
+
+The `CHECK` syntax is a deliberate subset of LLVM's FileCheck — literal
+substring matching only, no `{{...}}` regex captures and no strict
+order enforcement (because FileCheck itself is not bundled in the
+upstream LLVM Windows binary release).
+
+Filter to a single fixture by basename glob:
+
+```powershell
+pwsh tests/run.ps1 -Filter add_one_multi*
+```
+
+Tool locations are auto-detected; override with `-LlvmBin`, `-ExcLow`,
+`$env:LLVM_BIN`, or `$env:EXCLOW_BIN`.
+
+For a quick one-off run against an arbitrary source file:
 
 ```bash
 clang++ -emit-llvm -c -O0 my-test.cpp -o my-test.bc
