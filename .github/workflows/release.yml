@@ -1,0 +1,109 @@
+name: Build release binaries
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach assets to (e.g. v0.3.1)'
+        required: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: exception-lower-linux-x64.tar.gz
+            llvm_version: "18"
+          - os: windows-latest
+            artifact: exception-lower-windows-x64.zip
+            llvm_version: "18"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Linux ─────────────────────────────────────────────────────────
+      - name: Install LLVM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/llvm.asc >/dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ matrix.llvm_version }} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y llvm-${{ matrix.llvm_version }}-dev libzstd-dev zlib1g-dev
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR=/usr/lib/llvm-${{ matrix.llvm_version }}/lib/cmake/llvm
+          cmake --build build --config Release -j$(nproc)
+          strip build/exception-lower
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p pkg/bin
+          cp -f build/exception-lower pkg/bin/
+          tar -czf ${{ matrix.artifact }} -C pkg bin
+
+      # ── Windows ───────────────────────────────────────────────────────
+      - name: Cache LLVM (Windows)
+        if: runner.os == 'Windows'
+        id: cache-llvm-win
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm
+          key: llvm-${{ matrix.llvm_version }}.1.8-windows-x64-v2
+
+      - name: Download LLVM (Windows)
+        if: runner.os == 'Windows' && steps.cache-llvm-win.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $version = "${{ matrix.llvm_version }}.1.8"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile llvm.tar.xz -UseBasicParsing
+          7z x llvm.tar.xz -so | 7z x -si -ttar -oC:\llvm-extract
+          $dir = Get-ChildItem C:\llvm-extract -Directory | Select-Object -First 1
+          Move-Item $dir.FullName C:\llvm
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The LLVM prebuilt has hardcoded DIA SDK paths from its
+          # original build machine. Provide the actual DIA SDK location
+          # so the linker can resolve diaguids.lib.
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -property installationPath
+          $diaLib = Join-Path $vsPath "DIA SDK\lib\amd64"
+          if (-not (Test-Path $diaLib)) {
+            Write-Error "DIA SDK not found at $diaLib"
+            exit 1
+          }
+          Write-Host "DIA SDK lib: $diaLib"
+          $env:LIB = "$diaLib;$env:LIB"
+          cmake -B build -DCMAKE_BUILD_TYPE=Release `
+            -DLLVM_DIR=C:\llvm\lib\cmake\llvm
+          cmake --build build --config Release
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path pkg\bin -Force | Out-Null
+          Copy-Item build\Release\exception-lower.exe pkg\bin\
+          Compress-Archive -Path pkg\bin\* -DestinationPath ${{ matrix.artifact }}
+
+      # ── Upload to release ─────────────────────────────────────────────
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          files: ${{ matrix.artifact }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
