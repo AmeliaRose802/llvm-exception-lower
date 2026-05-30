@@ -608,6 +608,21 @@ bool lowerFunction(Function &Func, const ErrorState &State) {
   for (InvokeInst *Invoke : WL.Invokes)
     lowerInvoke(Invoke, State);
 
+  // 3b. Re-scan for CXA runtime calls that were originally `invoke`s and
+  //     got demoted to `call`s by step 3.  The worklist built before
+  //     invoke lowering only captures pre-existing CallInsts, so any
+  //     __cxa_begin_catch / __cxa_end_catch / __cxa_free_exception that
+  //     were invoked (common in nested try/catch) would be missed.
+  for (auto &BB : Func)
+    for (auto I = BB.begin(); I != BB.end(); ) {
+      Instruction &Inst = *I++;
+      auto *CI = dyn_cast<CallInst>(&Inst);
+      if (!CI || !CI->getCalledFunction()) continue;
+      CxaRuntime K = classifyCxa(CI->getCalledFunction());
+      if (K != CxaRuntime::None && !isThrowKind(K))
+        lowerCxaCall(CI, State);
+    }
+
   // 4. Lower throw-like calls — both __cxa_throw / __cxa_rethrow and the
   //    MSVC counterpart _CxxThrowException — AFTER invoke lowering, so
   //    previously-Invoke throw sites get their demoted `call` rewritten.
