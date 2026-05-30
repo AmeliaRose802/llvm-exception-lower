@@ -96,7 +96,10 @@ jobs:
           Get-ChildItem $cmakeDir -Filter *.cmake | ForEach-Object {
             $content = Get-Content $_.FullName -Raw
             if ($content -match 'DIA SDK') {
-              $patched = $content -replace '[^;"]*DIA SDK\\lib\\amd64[^;"]*', $diaLib
+              # Replace the directory portion of any DIA SDK path,
+              # keeping the trailing filename (e.g. \diaguids.lib)
+              $escaped = [regex]::Escape($diaLib)
+              $patched = $content -replace '[A-Z]:[^;"]*DIA SDK[/\\]lib[/\\]amd64', $diaLib
               Set-Content $_.FullName -Value $patched -NoNewline
               Write-Host "  Patched: $($_.Name)"
             }
