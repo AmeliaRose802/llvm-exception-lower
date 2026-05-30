@@ -79,8 +79,8 @@ jobs:
         shell: pwsh
         run: |
           # The LLVM prebuilt has hardcoded DIA SDK paths from its
-          # original build machine. Provide the actual DIA SDK location
-          # so the linker can resolve diaguids.lib.
+          # original build machine. Patch the cmake configs to use the
+          # actual DIA SDK location on this runner.
           $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vsPath = & $vsWhere -latest -property installationPath
           $diaLib = Join-Path $vsPath "DIA SDK\lib\amd64"
@@ -90,6 +90,18 @@ jobs:
           }
           Write-Host "DIA SDK lib: $diaLib"
           $env:LIB = "$diaLib;$env:LIB"
+
+          # Patch hardcoded DIA SDK paths in LLVM cmake files
+          $cmakeDir = "C:\llvm\lib\cmake\llvm"
+          Get-ChildItem $cmakeDir -Filter *.cmake | ForEach-Object {
+            $content = Get-Content $_.FullName -Raw
+            if ($content -match 'DIA SDK') {
+              $patched = $content -replace '[^;"]*DIA SDK\\lib\\amd64[^;"]*', $diaLib
+              Set-Content $_.FullName -Value $patched -NoNewline
+              Write-Host "  Patched: $($_.Name)"
+            }
+          }
+
           cmake -B build -DCMAKE_BUILD_TYPE=Release `
             -DLLVM_DIR=C:\llvm\lib\cmake\llvm
           cmake --build build --config Release
