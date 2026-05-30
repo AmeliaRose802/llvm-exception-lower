@@ -92,14 +92,13 @@ jobs:
           $env:LIB = "$diaLib;$env:LIB"
 
           # Patch hardcoded DIA SDK paths in LLVM cmake files
+          # CMake needs forward slashes on Windows paths.
           $cmakeDir = "C:\llvm\lib\cmake\llvm"
+          $diaLibFwd = $diaLib -replace '\\', '/'
           Get-ChildItem $cmakeDir -Filter *.cmake | ForEach-Object {
             $content = Get-Content $_.FullName -Raw
             if ($content -match 'DIA SDK') {
-              # Replace the directory portion of any DIA SDK path,
-              # keeping the trailing filename (e.g. \diaguids.lib)
-              $escaped = [regex]::Escape($diaLib)
-              $patched = $content -replace '[A-Z]:[^;"]*DIA SDK[/\\]lib[/\\]amd64', $diaLib
+              $patched = $content -replace '[A-Z]:[^;"]*DIA SDK[/\\]lib[/\\]amd64', $diaLibFwd
               Set-Content $_.FullName -Value $patched -NoNewline
               Write-Host "  Patched: $($_.Name)"
             }
