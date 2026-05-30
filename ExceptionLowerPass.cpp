@@ -22,9 +22,9 @@ namespace exclow {
 namespace {
 
 // Names for synthesized slots and blocks.
-constexpr StringRef kInFlightFlagName       = "exclow.error.flag";
-constexpr StringRef kThrownTypeInfoName     = "exclow.error.typeinfo";
-constexpr StringRef kThrownValuePtrName     = "exclow.error.value";
+constexpr StringRef kInFlightFlagName       = "__exclow_error_flag";
+constexpr StringRef kThrownTypeInfoName     = "__exclow_error_typeinfo";
+constexpr StringRef kThrownValuePtrName     = "__exclow_error_value";
 constexpr StringRef kEhCheckBlockSuffix     = ".ehcheck";
 constexpr StringRef kErrFlagLabel           = "exclow.err";
 constexpr StringRef kTypeInfoLabel          = "exclow.ti";
@@ -35,33 +35,35 @@ constexpr StringRef kCatchNextBlockName     = "exclow.catch.next";
 constexpr StringRef kUnhandledBlockName     = "exclow.unhandled";
 constexpr StringRef kCanonicalTypeDescPrefix = "__exclow.td.";
 
-// Per-function error-state slots. These live in `alloca`s in the entry block
-// (rather than thread-local globals) so that downstream tools that do not
-// pre-allocate module globals (e.g. SAW's crucible-llvm) can still execute
-// the lowered IR symbolically.
+// Module-level globals representing "an exception is currently propagating".
+// Using module globals (rather than per-function allocas) lets exception
+// state propagate across call boundaries: when a callee throws and
+// returns a sentinel, the caller's .ehcheck block can read the same flag.
+//
+// Downstream tools that require explicit global allocation (e.g. SAW's
+// crucible-llvm) must emit `llvm_alloc_global` for these names; the
+// saw-spec-gen tool does this automatically via `inject_exclow_globals`.
 struct ErrorState {
-  Value *inFlightFlag;    // pointer to i1
-  Value *thrownTypeInfo;  // pointer to ptr
-  Value *thrownValuePtr;  // pointer to ptr
+  GlobalVariable *inFlightFlag;    // i1:  true while an exception is live
+  GlobalVariable *thrownTypeInfo;  // ptr: std::type_info of thrown object
+  GlobalVariable *thrownValuePtr;  // ptr: address of the thrown object
 };
 
-ErrorState createErrorState(Function &Func) {
-  LLVMContext &Ctx = Func.getContext();
-  BasicBlock &Entry = Func.getEntryBlock();
-  IRBuilder<> B(&Entry, Entry.getFirstInsertionPt());
+GlobalVariable *getOrCreateGlobal(Module &Mod, StringRef Name, Type *Ty) {
+  if (auto *Existing = Mod.getGlobalVariable(Name))
+    return Existing;
+  return new GlobalVariable(Mod, Ty, /*isConstant=*/false,
+                            GlobalValue::InternalLinkage,
+                            Constant::getNullValue(Ty), Name);
+}
 
-  Type *BoolTy = Type::getInt1Ty(Ctx);
-  PointerType *PtrTy = PointerType::getUnqual(Ctx);
-
-  AllocaInst *Flag = B.CreateAlloca(BoolTy, nullptr, kInFlightFlagName);
-  AllocaInst *TI   = B.CreateAlloca(PtrTy,  nullptr, kThrownTypeInfoName);
-  AllocaInst *Val  = B.CreateAlloca(PtrTy,  nullptr, kThrownValuePtrName);
-
-  B.CreateStore(ConstantInt::getFalse(Ctx),       Flag);
-  B.CreateStore(ConstantPointerNull::get(PtrTy),  TI);
-  B.CreateStore(ConstantPointerNull::get(PtrTy),  Val);
-
-  return { Flag, TI, Val };
+ErrorState getOrCreateErrorState(Module &Mod) {
+  auto &Ctx = Mod.getContext();
+  return {
+      getOrCreateGlobal(Mod, kInFlightFlagName,   Type::getInt1Ty(Ctx)),
+      getOrCreateGlobal(Mod, kThrownTypeInfoName, PointerType::getUnqual(Ctx)),
+      getOrCreateGlobal(Mod, kThrownValuePtrName, PointerType::getUnqual(Ctx)),
+  };
 }
 
 // A "sentinel" return value used when an exception escapes the function.
@@ -550,11 +552,46 @@ void lowerCatchSwitch(const CatchSwitchSnapshot &Snap, Function &Func,
   S->eraseFromParent();
 }
 
-bool lowerFunction(Function &Func) {
+// Replace `call i32 @llvm.eh.typeid.for(ptr @TypeInfo)` with a direct
+// pointer comparison against the stored typeinfo.  The landing-pad
+// lowering sets the selector to 0 for every thrown type, so the original
+// `icmp eq i32 %sel, %tid` can never match.  Instead we find the icmp
+// that uses the typeid result and rewrite it to compare the thrown
+// typeinfo pointer directly: `icmp eq ptr <thrown_ti>, @TypeInfo`.
+void lowerEhTypeidFor(Function &Func, const ErrorState &State) {
+  SmallVector<CallInst *, 4> TypeIdCalls;
+  for (auto &BB : Func)
+    for (auto &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->getCalledFunction() &&
+            CI->getCalledFunction()->getName().starts_with(
+                "llvm.eh.typeid.for"))
+          TypeIdCalls.push_back(CI);
+
+  for (CallInst *TID : TypeIdCalls) {
+    Value *CatchTypeInfo = TID->getArgOperand(0);
+    SmallVector<ICmpInst *, 2> IcmpUsers;
+    for (User *U : TID->users())
+      if (auto *IC = dyn_cast<ICmpInst>(U))
+        IcmpUsers.push_back(IC);
+    for (ICmpInst *IC : IcmpUsers) {
+      IRBuilder<> B(IC);
+      Value *ThrownTI = B.CreateLoad(
+          PointerType::getUnqual(Func.getContext()),
+          State.thrownTypeInfo, "exclow.thrown.ti");
+      Value *Match = B.CreateICmpEQ(ThrownTI, CatchTypeInfo,
+                                    kCatchMatchLabel);
+      IC->replaceAllUsesWith(Match);
+      IC->eraseFromParent();
+    }
+    if (TID->use_empty())
+      TID->eraseFromParent();
+  }
+}
+
+bool lowerFunction(Function &Func, const ErrorState &State) {
   if (!functionHasEHWork(Func))
     return false;
-
-  ErrorState State = createErrorState(Func);
 
   LoweringWorklist WL;
   WL.visit(Func);
@@ -634,6 +671,11 @@ bool lowerFunction(Function &Func) {
   //     to load.
   stripFuncletBundles(Func);
 
+  // 11. Eliminate llvm.eh.typeid.for intrinsics left over from Itanium
+  //     landing-pad lowering. Must run after lowerInvoke so that the
+  //     global error-state variables are already wired up.
+  lowerEhTypeidFor(Func, State);
+
   return true;
 }
 
@@ -641,11 +683,26 @@ bool lowerFunction(Function &Func) {
 
 PreservedAnalyses ExceptionLowerPass::run(Module &Mod,
                                           ModuleAnalysisManager &) {
+  // Only create module-level globals if at least one function actually
+  // contains EH constructs. Without this guard, every module gets
+  // __exclow_error_* globals even when no exception handling exists,
+  // which breaks SAW verification of non-exception code.
+  bool NeedsLowering = false;
+  for (Function &Func : Mod) {
+    if (!Func.isDeclaration() && functionHasEHWork(Func)) {
+      NeedsLowering = true;
+      break;
+    }
+  }
+  if (!NeedsLowering)
+    return PreservedAnalyses::all();
+
+  const ErrorState State = getOrCreateErrorState(Mod);
   bool Changed = false;
   for (Function &Func : Mod) {
     if (Func.isDeclaration())
       continue;
-    Changed |= lowerFunction(Func);
+    Changed |= lowerFunction(Func, State);
   }
 
   // After lowering, none of the EH-runtime declarations or the personality
