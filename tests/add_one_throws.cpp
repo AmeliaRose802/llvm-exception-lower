@@ -6,17 +6,20 @@ extern "C" unsigned add_one(unsigned x) {
 
 // MSVC `_CxxThrowException` is rewritten to error-state stores plus a sentinel
 // return. The MSVC throw-info global `_TI1H` is mapped onto the canonical
-// `@__exclow.td.H` synthesized symbol.
+// `@__exclow.td.H` synthesized symbol. Error state lives in module-level
+// globals (`@__exclow_error_flag` / `_typeinfo` / `_value`) so it propagates
+// across call boundaries.
 //
+// CHECK:       @__exclow_error_flag = internal global i1 false
+// CHECK:       @__exclow_error_typeinfo = internal global ptr null
+// CHECK:       @__exclow_error_value = internal global ptr null
 // CHECK:       @__exclow.td.H = internal constant i8 0, align 1
 // CHECK-LABEL: define dso_local i32 @add_one(
-// CHECK:       %exclow.error.flag = alloca i1
-// CHECK:       %exclow.error.typeinfo = alloca ptr
-// CHECK:       %exclow.error.value = alloca ptr
-// CHECK:       store ptr @__exclow.td.H, ptr %exclow.error.typeinfo
-// CHECK:       store i1 true, ptr %exclow.error.flag
+// CHECK:       store ptr @__exclow.td.H, ptr @__exclow_error_typeinfo
+// CHECK:       store i1 true, ptr @__exclow_error_flag
 // CHECK:       ret i32 0
 //
+// CHECK-NOT:   alloca i1
 // CHECK-NOT:   _CxxThrowException
 // CHECK-NOT:   __CxxFrameHandler3
 // CHECK-NOT:   personality
