@@ -25,18 +25,23 @@ extern "C" unsigned add_one(unsigned x) {
 // an intermediate `exclow.catch.next` block separating the arms and a
 // terminal `exclow.unhandled` sentinel. Each tag's throw-info `_TI1?AU<Tag>@@`
 // and type-descriptor `??_R0?AU<Tag>@@@8` are folded onto one canonical
-// `@"__exclow.td.?AU<Tag>@@"` symbol so both sides compare equal.
+// `@"__exclow.td.?AU<Tag>@@"` symbol so both sides compare equal. The error
+// state lives in module-level globals so the dispatch chain can read what the
+// throw site stored.
 //
+// CHECK:       @__exclow_error_flag = internal global i1 false
+// CHECK:       @__exclow_error_typeinfo = internal global ptr null
 // CHECK-DAG:   @"__exclow.td.?AUHarmlessTag@@" = internal constant i8 0
 // CHECK-DAG:   @"__exclow.td.?AUHarmfulTag@@" = internal constant i8 0
 // CHECK-LABEL: define dso_local i32 @add_one(
-// CHECK-DAG:   store ptr @"__exclow.td.?AUHarmlessTag@@", ptr %exclow.error.typeinfo
-// CHECK-DAG:   store ptr @"__exclow.td.?AUHarmfulTag@@", ptr %exclow.error.typeinfo
+// CHECK-DAG:   store ptr @"__exclow.td.?AUHarmlessTag@@", ptr @__exclow_error_typeinfo
+// CHECK-DAG:   store ptr @"__exclow.td.?AUHarmfulTag@@", ptr @__exclow_error_typeinfo
 // CHECK-DAG:   icmp eq ptr %exclow.ti, @"__exclow.td.?AUHarmlessTag@@"
 // CHECK-DAG:   icmp eq ptr %exclow.ti, @"__exclow.td.?AUHarmfulTag@@"
 // CHECK:       exclow.catch.next:
 // CHECK:       exclow.unhandled:
 //
+// CHECK-NOT:   alloca i1
 // CHECK-NOT:   catchswitch
 // CHECK-NOT:   catchpad
 // CHECK-NOT:   cleanuppad

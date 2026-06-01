@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Allow only one concurrent run per ref; cancel in-progress runs of older
+# commits on the same PR / branch.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: exception-lower-linux-x64.tar.gz
+            llvm_version: "18"
+          - os: windows-latest
+            artifact: exception-lower-windows-x64.zip
+            llvm_version: "18"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Linux: install LLVM dev packages ──────────────────────────────
+      - name: Install LLVM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/llvm.asc >/dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ matrix.llvm_version }} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y \
+            llvm-${{ matrix.llvm_version }}-dev \
+            clang-${{ matrix.llvm_version }} \
+            libzstd-dev zlib1g-dev
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR=/usr/lib/llvm-${{ matrix.llvm_version }}/lib/cmake/llvm
+          cmake --build build --config Release -j$(nproc)
+
+      - name: Test (Linux)
+        if: runner.os == 'Linux'
+        env:
+          CLANGXX: /usr/lib/llvm-${{ matrix.llvm_version }}/bin/clang++
+          OPT: /usr/lib/llvm-${{ matrix.llvm_version }}/bin/opt
+          LLVM_DIS: /usr/lib/llvm-${{ matrix.llvm_version }}/bin/llvm-dis
+          EXCLOW_BIN: ${{ github.workspace }}/build/exception-lower
+        run: bash tests/run.sh
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          strip build/exception-lower
+          mkdir -p pkg/bin
+          cp -f build/exception-lower pkg/bin/
+          tar -czf ${{ matrix.artifact }} -C pkg bin
+
+      # ── Windows: download LLVM prebuilt ───────────────────────────────
+      - name: Cache LLVM (Windows)
+        if: runner.os == 'Windows'
+        id: cache-llvm-win
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm
+          key: llvm-${{ matrix.llvm_version }}.1.8-windows-x64-v2
+
+      - name: Download LLVM (Windows)
+        if: runner.os == 'Windows' && steps.cache-llvm-win.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $version = "${{ matrix.llvm_version }}.1.8"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile llvm.tar.xz -UseBasicParsing
+          7z x llvm.tar.xz -so | 7z x -si -ttar -oC:\llvm-extract
+          $dir = Get-ChildItem C:\llvm-extract -Directory | Select-Object -First 1
+          Move-Item $dir.FullName C:\llvm
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The LLVM Windows prebuilt has hardcoded DIA SDK paths from its
+          # original build machine. Patch the cmake configs to use the
+          # actual DIA SDK location on this runner.
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -property installationPath
+          $diaLib = Join-Path $vsPath "DIA SDK\lib\amd64"
+          if (-not (Test-Path $diaLib)) {
+            Write-Error "DIA SDK not found at $diaLib"
+            exit 1
+          }
+          Write-Host "DIA SDK lib: $diaLib"
+          $env:LIB = "$diaLib;$env:LIB"
+
+          $cmakeDir = "C:\llvm\lib\cmake\llvm"
+          $diaLibFwd = $diaLib -replace '\\', '/'
+          Get-ChildItem $cmakeDir -Filter *.cmake | ForEach-Object {
+            $content = Get-Content $_.FullName -Raw
+            if ($content -match 'DIA SDK') {
+              $patched = $content -replace '[A-Z]:[^;"]*DIA SDK[/\\]lib[/\\]amd64', $diaLibFwd
+              Set-Content $_.FullName -Value $patched -NoNewline
+              Write-Host "  Patched: $($_.Name)"
+            }
+          }
+
+          cmake -B build -DCMAKE_BUILD_TYPE=Release `
+            -DLLVM_DIR=C:\llvm\lib\cmake\llvm
+          cmake --build build --config Release
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          LLVM_BIN: C:\llvm\bin
+          EXCLOW_BIN: ${{ github.workspace }}\build\Release\exception-lower.exe
+        run: pwsh tests/run.ps1
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path pkg\bin -Force | Out-Null
+          Copy-Item build\Release\exception-lower.exe pkg\bin\
+          Compress-Archive -Path pkg\bin\* -DestinationPath ${{ matrix.artifact }}
+
+      # ── Upload built binary as a workflow artifact ────────────────────
+      # Always uploaded so PR reviewers can grab a build, and so the
+      # publish-latest job below can pull them on push-to-main.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # On push to main (i.e. after a PR merges), publish the freshly built
+  # Linux + Windows binaries to a rolling `latest-main` pre-release. This
+  # keeps the tag-driven release.yml workflow free to handle stable
+  # versioned releases.
+  publish-latest:
+    name: Publish rolling latest-main pre-release
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release assets
+        run: |
+          mkdir -p staging
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+            -exec cp -f {} staging/ \;
+          ls -la staging
+
+      - name: Delete previous latest-main release (if any)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest-main --cleanup-tag --yes || true
+
+      - name: Publish latest-main pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-main
+          name: "Latest build from main"
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          body: |
+            Rolling build of `main` (commit ${{ github.sha }}).
+
+            These binaries are produced automatically by the CI workflow
+            every time a PR merges into `main`. For stable versioned
+            releases, see the tagged releases.
+          files: |
+            staging/*.tar.gz
+            staging/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

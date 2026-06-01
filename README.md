@@ -41,10 +41,11 @@ cmake .. -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
 
 ## Transformation summary
 
-The pass introduces three function-local `alloca` slots in the entry block
-of every function it touches — an in-flight flag (`i1`), the thrown
-`type_info` pointer, and the thrown value pointer — and rewrites the
-following constructs in terms of those slots:
+The pass introduces three module-level `internal global` slots — an in-flight
+flag (`@__exclow_error_flag`, `i1`), the thrown `type_info` pointer
+(`@__exclow_error_typeinfo`, `ptr`), and the thrown value pointer
+(`@__exclow_error_value`, `ptr`) — and rewrites the following constructs in
+terms of those slots:
 
 | Original construct         | Replacement                                                      |
 |----------------------------|------------------------------------------------------------------|
@@ -68,10 +69,14 @@ following constructs in terms of those slots:
 
 ### Notes for MSVC C++ EH
 
-* The three flag slots live as function-local `alloca`s rather than as
-  thread-local module globals so that downstream tools which do not
-  pre-allocate module globals (notably SAW's crucible-llvm) can execute
-  the lowered IR without any post-processing.
+* The three error-state slots are module-level `internal global`s rather
+  than per-function `alloca`s so that exception state propagates across
+  call boundaries: when a callee throws and returns a sentinel, the
+  caller's `.ehcheck` block reads the same flag. Downstream tools that
+  require explicit module-global allocation (notably SAW's crucible-llvm)
+  must emit `llvm_alloc_global` for `@__exclow_error_flag`,
+  `@__exclow_error_typeinfo`, and `@__exclow_error_value`. The
+  `saw-spec-gen` tool does this automatically via `inject_exclow_globals`.
 * `_CxxThrowException(value, throw-info)` is rewritten in the same shape
   as `__cxa_throw` — the throw-info pointer goes into the typeinfo slot,
   the value pointer into the value slot, the in-flight flag is set, and
@@ -81,7 +86,10 @@ following constructs in terms of those slots:
   source order. A catchpad with a null type descriptor (`catch (...)`)
   becomes an unconditional branch and shadows any later handlers. If no
   handler matches, control flows to the catchswitch's unwind destination
-  (or to a synthesized sentinel-return block if it has none).
+  (or to a synthesized sentinel-return block if it has none). Itanium
+  landingpad dispatch is lowered the same way: `@llvm.eh.typeid.for`
+  calls are eliminated and replaced with direct `icmp eq` against the
+  stored typeinfo pointer.
 * `"funclet"` operand bundles on calls that used to live inside a
   catchpad / cleanuppad are stripped after funclet lowering. The parent
   token they referenced has been replaced with `undef`, and the bundle
