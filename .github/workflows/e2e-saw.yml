@@ -78,7 +78,10 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends cmake ninja-build
+          # zlib/zstd/libxml2 dev libs: the LLVM 20 prebuilt's cmake config
+          # declares them as transitive link deps of the LLVM libraries.
+          apt-get install -y --no-install-recommends \
+            cmake ninja-build zlib1g-dev libzstd-dev libxml2-dev
 
       - name: Build exception-lower (LLVM 20 from image)
         run: |
