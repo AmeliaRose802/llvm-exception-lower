@@ -78,15 +78,23 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update
-          # zlib/zstd/libxml2 dev libs: the LLVM 20 prebuilt's cmake config
-          # declares them as transitive link deps of the LLVM libraries.
           apt-get install -y --no-install-recommends \
-            cmake ninja-build zlib1g-dev libzstd-dev libxml2-dev
+            cmake ninja-build wget gnupg lsb-release software-properties-common \
+            zlib1g-dev libzstd-dev libxml2-dev
+          # Build exception-lower against a real LLVM 20 *dev* toolchain from
+          # apt.llvm.org. The LLVM baked into the container exists to *run*
+          # saw-spec-gen's tools (clang/opt/llvm-as); its static archives are
+          # not linkable by GNU ld here ("file format not recognized"). The
+          # baked LLVM is still used at runtime via SAW_SPEC_GEN_LLVM_BIN.
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          /tmp/llvm.sh 20
+          apt-get install -y --no-install-recommends llvm-20-dev
 
-      - name: Build exception-lower (LLVM 20 from image)
+      - name: Build exception-lower (LLVM 20 dev toolchain)
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_DIR=/root/.saw-spec-gen/llvm/lib/cmake/llvm
+            -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
           cmake --build build -j"$(nproc)"
           ./build/exception-lower --help | head -1
 
