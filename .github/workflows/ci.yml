@@ -2,8 +2,12 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore:
+      - "**/*.md"
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
 
 # Allow only one concurrent run per ref; cancel in-progress runs of older
 # commits on the same PR / branch.
