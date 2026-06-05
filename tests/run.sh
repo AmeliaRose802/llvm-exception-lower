@@ -83,10 +83,11 @@ verify_checks() {
     while IFS= read -r line; do
         # Trim leading whitespace.
         line="${line#"${line%%[![:space:]]*}"}"
-        # Match `// CHECK[-NOT|-DAG|-LABEL]: <pattern>`
-        if [[ "$line" =~ ^//[[:space:]]*(CHECK(-NOT|-DAG|-LABEL)?):[[:space:]]+(.*)$ ]]; then
-            kind="${BASH_REMATCH[1]}"
-            pattern="${BASH_REMATCH[3]}"
+        # Match `// CHECK[-NOT|-DAG|-LABEL]: <pattern>` or the `;`-prefixed
+        # LLVM IR comment form used by .ll fixtures.
+        if [[ "$line" =~ ^(//|\;)[[:space:]]*(CHECK(-NOT|-DAG|-LABEL)?):[[:space:]]+(.*)$ ]]; then
+            kind="${BASH_REMATCH[2]}"
+            pattern="${BASH_REMATCH[4]}"
             # Trim trailing whitespace from pattern.
             pattern="${pattern%"${pattern##*[![:space:]]}"}"
             total=$((total+1))
@@ -111,12 +112,28 @@ verify_checks() {
     printf '%d %d\n' "$total" "$failed"
 }
 
+# Read an optional `// EXCLOW-ARGS: <args>` / `; EXCLOW-ARGS: <args>` directive
+# from the fixture and echo the extra arguments to forward to exception-lower
+# (e.g. `--mode=cleanup-only`). Echoes nothing when absent.
+get_exclow_args() {
+    local src="$1" line
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ "$line" =~ ^(//|\;)[[:space:]]*EXCLOW-ARGS:[[:space:]]+(.*)$ ]]; then
+            local args="${BASH_REMATCH[2]}"
+            args="${args%"${args##*[![:space:]]}"}"
+            printf '%s' "$args"
+            return
+        fi
+    done <"$src"
+}
+
 # -- fixture loop ----------------------------------------------------------
 
 shopt -s nullglob
 fixtures=()
-for f in "$script_dir"/*.cpp; do
-    base="$(basename "$f" .cpp)"
+for f in "$script_dir"/*.cpp "$script_dir"/*.ll; do
+    base="$(basename "$f")"; base="${base%.*}"
     # shellcheck disable=SC2053
     [[ $base == $filter ]] && fixtures+=("$f")
 done
@@ -131,21 +148,32 @@ total_fail=0
 failed_names=()
 
 for f in "${fixtures[@]}"; do
-    name="$(basename "$f" .cpp)"
+    base="$(basename "$f")"; name="${base%.*}"
+    ext="${f##*.}"
     echo "=== $name ==="
-
-    triple="x86_64-pc-windows-msvc"
-    [[ "$name" == itanium_* ]] && triple="x86_64-pc-linux-gnu"
 
     bc="$out_dir/$name.bc"
     low_bc="$out_dir/${name}_lowered.bc"
     low_ll="$out_dir/${name}_lowered.ll"
 
-    if ! "$CLANGXX" -target "$triple" -O0 -emit-llvm -c "$f" -o "$bc" 2>&1; then
-        echo "  FAIL (clang++)"
-        total_fail=$((total_fail+1)); failed_names+=("$name (compile)"); continue
+    # Extra args (e.g. --mode=cleanup-only) declared by the fixture itself.
+    exc_extra="$(get_exclow_args "$f")"
+    read -r -a exc_extra_arr <<<"$exc_extra"
+
+    if [[ "$ext" == "ll" ]]; then
+        # Pre-built LLVM IR fixture: feed straight to exception-lower.
+        lower_input="$f"
+    else
+        triple="x86_64-pc-windows-msvc"
+        [[ "$name" == itanium_* ]] && triple="x86_64-pc-linux-gnu"
+        if ! "$CLANGXX" -target "$triple" -O0 -emit-llvm -c "$f" -o "$bc" 2>&1; then
+            echo "  FAIL (clang++)"
+            total_fail=$((total_fail+1)); failed_names+=("$name (compile)"); continue
+        fi
+        lower_input="$bc"
     fi
-    if ! "$EXCLOW_BIN" "$bc" -o "$low_bc" 2>&1; then
+
+    if ! "$EXCLOW_BIN" "$lower_input" "${exc_extra_arr[@]}" -o "$low_bc" 2>&1; then
         echo "  FAIL (exception-lower)"
         total_fail=$((total_fail+1)); failed_names+=("$name (lower)"); continue
     fi
