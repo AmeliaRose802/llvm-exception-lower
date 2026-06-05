@@ -4,8 +4,12 @@
 # They do not prove that SAW / Crucible can actually load and symbolically
 # execute it. This workflow closes that gap: it builds exception-lower from
 # the PR source and runs saw-spec-gen's exception-lowering end-to-end proofs
-# (the `cpp_throws` tag — Itanium + MSVC try/catch lowered, then proved by
-# SAW) against the *freshly built* binary, before merge.
+# against the *freshly built* binary, before merge. Two tags are exercised:
+#   * `cpp_throws`    — Itanium + MSVC C++ try/catch lowered, then proved by SAW.
+#   * `rust_cleanup`  — Rust drop-glue cleanuppad/cleanupret funclets (compiled
+#                       with -C panic=unwind) lowered, then proved by SAW.
+# Both classes of fixture are loaded and symbolically executed by SAW after the
+# freshly built pass rewrites their cleanup funclets into explicit error-flag CFG.
 #
 # How the freshly built binary is injected: saw-spec-gen's tool discovery
 # honours the `SAW_SPEC_GEN_EXCEPTION_LOWER` environment variable above all
@@ -113,16 +117,19 @@ jobs:
         working-directory: saw-spec-gen
         run: cargo build --release
 
-      - name: Run cpp_throws proofs against freshly built pass
+      - name: Run cpp_throws + rust_cleanup proofs against freshly built pass
         working-directory: saw-spec-gen
         env:
           SAW_SPEC_GEN_EXCEPTION_LOWER: ${{ github.workspace }}/build/exception-lower
-        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws
+        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws,rust_cleanup
 
   # ── Windows: no container; install the toolchain via saw-spec-gen init ──
   # exception-lower is built against an LLVM 20 prebuilt; init.ps1 reuses it
   # (via SAW_SPEC_GEN_LLVM_BIN) and downloads only SAW + solvers. This is the
-  # only job that exercises the MSVC SEH funclet lowering path end-to-end.
+  # only job that exercises the MSVC SEH funclet lowering path end-to-end \u2014
+  # for both C++ try/catch (cpp_throws) and Rust drop-glue cleanup funclets
+  # (rust_cleanup, compiled with -C panic=unwind). windows-latest ships rustc,
+  # which the Rust cases need.
   windows:
     name: SAW e2e (Windows)
     runs-on: windows-latest
@@ -202,10 +209,10 @@ jobs:
           SAW_SPEC_GEN_LLVM_BIN: C:\llvm\bin
         run: pwsh scripts/init.ps1 -SkipExceptionLower
 
-      - name: Run cpp_throws proofs against freshly built pass
+      - name: Run cpp_throws + rust_cleanup proofs against freshly built pass
         shell: pwsh
         working-directory: saw-spec-gen
         env:
           SAW_SPEC_GEN_LLVM_BIN: C:\llvm\bin
           SAW_SPEC_GEN_EXCEPTION_LOWER: ${{ github.workspace }}\build\Release\exception-lower.exe
-        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws
+        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws,rust_cleanup
