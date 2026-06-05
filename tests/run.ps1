@@ -97,7 +97,9 @@ Write-Host ""
 function Get-CheckDirectives([string]$Path) {
     $checks = New-Object System.Collections.Generic.List[object]
     foreach ($line in Get-Content -LiteralPath $Path) {
-        if ($line -match '^\s*//\s*(CHECK(?:-(?:NOT|DAG|LABEL))?):\s*(.+?)\s*$') {
+        # Accept both C++ (`//`) and LLVM IR (`;`) comment prefixes so the
+        # same CHECK syntax works for .cpp and .ll fixtures.
+        if ($line -match '^\s*(?://|;)\s*(CHECK(?:-(?:NOT|DAG|LABEL))?):\s*(.+?)\s*$') {
             $checks.Add([pscustomobject]@{
                 Kind    = $Matches[1]
                 Pattern = $Matches[2]
@@ -105,6 +107,19 @@ function Get-CheckDirectives([string]$Path) {
         }
     }
     ,$checks
+}
+
+# Read an optional `// EXCLOW-ARGS: <args>` or `; EXCLOW-ARGS: <args>` directive
+# from the fixture and return the extra command-line arguments (as an array) to
+# forward to exception-lower. Used by .ll fixtures to exercise explicit modes
+# such as `--mode=cleanup-only`.
+function Get-ExclowArgs([string]$Path) {
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^\s*(?://|;)\s*EXCLOW-ARGS:\s*(.+?)\s*$') {
+            return ($Matches[1] -split '\s+')
+        }
+    }
+    return @()
 }
 
 function Test-CheckDirectives([string]$IrPath, $Checks) {
@@ -124,9 +139,21 @@ function Test-CheckDirectives([string]$IrPath, $Checks) {
 
 # -- fixture loop ----------------------------------------------------------
 
-$fixtures = Get-ChildItem -LiteralPath $TestsDir -Filter '*.cpp' |
+# Fixtures are either C++ translation units (.cpp, compiled to bitcode) or
+# pre-built LLVM IR (.ll, fed straight to exception-lower). The .ll fixtures
+# carry Win64 SEH funclet IR matching what `rustc --emit=llvm-bc` produces, so
+# the Rust cleanup-funclet path can be tested without a Rust toolchain.
+$fixtures = Get-ChildItem -LiteralPath $TestsDir -Include '*.cpp','*.ll' -File -Recurse:$false |
             Where-Object { $_.BaseName -like $Filter } |
             Sort-Object Name
+
+if (-not $fixtures) {
+    # -Include needs -Recurse or a wildcard path on some PowerShell versions;
+    # fall back to an explicit two-pattern gather.
+    $fixtures = @(Get-ChildItem -LiteralPath $TestsDir -Filter '*.cpp') +
+                @(Get-ChildItem -LiteralPath $TestsDir -Filter '*.ll')
+    $fixtures = $fixtures | Where-Object { $_.BaseName -like $Filter } | Sort-Object Name
+}
 
 if ($fixtures.Count -eq 0) {
     Write-Error "No fixtures matched filter '$Filter'."
@@ -141,20 +168,32 @@ foreach ($f in $fixtures) {
     $name = $f.BaseName
     Write-Host "=== $name ===" -ForegroundColor Cyan
 
-    $triple = if ($name -like 'itanium_*') { 'x86_64-pc-linux-gnu' }
-              else { 'x86_64-pc-windows-msvc' }
-
     $bc     = Join-Path $OutDir "$name.bc"
     $low_bc = Join-Path $OutDir "${name}_lowered.bc"
     $low_ll = Join-Path $OutDir "${name}_lowered.ll"
 
-    & $Clang -target $triple -O0 -emit-llvm -c $f.FullName -o $bc 2>&1 | Write-Host
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  FAIL (clang++ exit $LASTEXITCODE)" -ForegroundColor Red
-        $totalFail++; $failureNames.Add("$name (compile)"); continue
+    # Wrap in @() so a single-element result stays an array — splatting a bare
+    # string would otherwise iterate its characters.
+    $excArgs = @(Get-ExclowArgs -Path $f.FullName)
+
+    if ($f.Extension -eq '.ll') {
+        # Pre-built IR fixture: exception-lower parses .ll directly.
+        $lowerInput = $f.FullName
+    } else {
+        # C++ fixture: compile to bitcode first (Windows-MSVC EH by default,
+        # Itanium EH for fixtures named itanium_*).
+        $triple = if ($name -like 'itanium_*') { 'x86_64-pc-linux-gnu' }
+                  else { 'x86_64-pc-windows-msvc' }
+
+        & $Clang -target $triple -O0 -emit-llvm -c $f.FullName -o $bc 2>&1 | Write-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  FAIL (clang++ exit $LASTEXITCODE)" -ForegroundColor Red
+            $totalFail++; $failureNames.Add("$name (compile)"); continue
+        }
+        $lowerInput = $bc
     }
 
-    & $ExcLow $bc -o $low_bc 2>&1 | Write-Host
+    & $ExcLow $lowerInput @excArgs -o $low_bc 2>&1 | Write-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  FAIL (exception-lower exit $LASTEXITCODE)" -ForegroundColor Red
         $totalFail++; $failureNames.Add("$name (lower)"); continue

@@ -589,6 +589,113 @@ void lowerEhTypeidFor(Function &Func, const ErrorState &State) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Cleanup-only lowering (Rust drop-glue path).
+//
+// On `x86_64-pc-windows-msvc`, rustc emits Win64 SEH *cleanup* funclets for
+// `Drop` glue: an `invoke` whose unwind edge targets a `cleanuppad` block,
+// with `cleanupret ... unwind to caller` and `[ "funclet"(token %cp) ]`
+// bundles on the calls inside. There is no `catchpad` / `catchswitch` — Rust
+// drop glue never *catches*. SAW's `llvm-pretty-bc-parser` rejects the
+// `"funclet"` operand bundle before any simulation can run.
+//
+// The full error-flag lowering would work, but it threads a global in-flight
+// flag through every call site, producing branchy IR. For the panic-free
+// verified path the cleanup funclets never execute, so we can do something
+// much simpler and cleaner: drop each invoke's unwind edge (turning it into a
+// plain `call` + `br` to the normal destination), strip the funclet bundles,
+// clear the personality, and delete the now-unreachable funclet blocks. The
+// result is straight-line code with no error-state globals at all.
+
+// Does this function's EH work consist solely of cleanup funclets (no catch
+// dispatch of any kind)? Such functions take the lightweight cleanup-only
+// path under LoweringMode::Auto.
+bool isCleanupOnlyFunction(Function &Func) {
+  bool HasCleanup = false;
+  for (BasicBlock &BB : Func) {
+    for (Instruction &I : BB) {
+      if (isa<CleanupPadInst>(&I) || isa<CleanupReturnInst>(&I)) {
+        HasCleanup = true;
+        continue;
+      }
+      // Any catch-style construct (MSVC or Itanium) disqualifies the
+      // function from the cleanup-only path — those need the typed dispatch
+      // the full lowering provides.
+      if (isa<CatchPadInst>(&I) || isa<CatchSwitchInst>(&I) ||
+          isa<CatchReturnInst>(&I) || isa<LandingPadInst>(&I) ||
+          isa<ResumeInst>(&I))
+        return false;
+    }
+  }
+  return HasCleanup;
+}
+
+// Convert an `invoke` into a plain `call` followed by an unconditional branch
+// to its normal destination, discarding the unwind edge entirely. Returns the
+// synthesized call. The unwind destination loses this predecessor (its PHIs,
+// if any, are fixed up).
+CallInst *demoteInvokeDroppingUnwind(InvokeInst *Invoke) {
+  BasicBlock *NormalDest = Invoke->getNormalDest();
+  BasicBlock *UnwindDest = Invoke->getUnwindDest();
+  BasicBlock *InvokeBB = Invoke->getParent();
+
+  IRBuilder<> Builder(Invoke);
+  SmallVector<Value *, 8> Args(Invoke->args());
+  SmallVector<OperandBundleDef, 2> Bundles;
+  Invoke->getOperandBundlesAsDefs(Bundles);
+
+  CallInst *Call = Builder.CreateCall(Invoke->getFunctionType(),
+                                      Invoke->getCalledOperand(), Args,
+                                      Bundles);
+  Call->setCallingConv(Invoke->getCallingConv());
+  Call->setAttributes(Invoke->getAttributes());
+  if (!Invoke->getType()->isVoidTy())
+    Invoke->replaceAllUsesWith(Call);
+  Builder.CreateBr(NormalDest);
+
+  // Drop the unwind edge: remove this block as a predecessor of the funclet
+  // landing block so its PHIs (if any) stay well-formed before it is deleted.
+  UnwindDest->removePredecessor(InvokeBB);
+
+  Invoke->eraseFromParent();
+  return Call;
+}
+
+// Lower a function using the cleanup-only strategy. Returns true if anything
+// changed. Does not touch or require the module-level error-state globals.
+bool lowerFunctionCleanupOnly(Function &Func) {
+  if (!functionHasEHWork(Func))
+    return false;
+
+  // 1. Demote every invoke to a call + branch to the normal destination,
+  //    discarding the unwind edge. This severs the only way control could
+  //    reach the funclet blocks.
+  SmallVector<InvokeInst *, 8> Invokes;
+  for (BasicBlock &BB : Func)
+    for (Instruction &I : BB)
+      if (auto *II = dyn_cast<InvokeInst>(&I))
+        Invokes.push_back(II);
+  for (InvokeInst *II : Invokes)
+    demoteInvokeDroppingUnwind(II);
+
+  // 2. Strip `"funclet"` operand bundles from every remaining call. The pad
+  //    tokens they reference are about to disappear, and SAW's bitcode
+  //    parser rejects the bundle regardless.
+  stripFuncletBundles(Func);
+
+  // 3. The personality function (MSVC `__CxxFrameHandler3`) is now dead.
+  if (Func.hasPersonalityFn())
+    Func.setPersonalityFn(nullptr);
+
+  // 4. Delete the funclet blocks, which are now unreachable from entry.
+  //    EliminateUnreachableBlocks replaces cross-block token uses (e.g. a
+  //    `cleanupret from %cleanuppad`) with `undef` as it removes the blocks,
+  //    so the leftover `cleanuppad` / `cleanupret` instructions go with them.
+  EliminateUnreachableBlocks(Func);
+
+  return true;
+}
+
 bool lowerFunction(Function &Func, const ErrorState &State) {
   if (!functionHasEHWork(Func))
     return false;
@@ -698,26 +805,54 @@ bool lowerFunction(Function &Func, const ErrorState &State) {
 
 PreservedAnalyses ExceptionLowerPass::run(Module &Mod,
                                           ModuleAnalysisManager &) {
-  // Only create module-level globals if at least one function actually
-  // contains EH constructs. Without this guard, every module gets
-  // __exclow_error_* globals even when no exception handling exists,
-  // which breaks SAW verification of non-exception code.
-  bool NeedsLowering = false;
+  // Decide, per function, which lowering path it will take. A function takes
+  // the cleanup-only path when the mode forces it, or — under Auto — when its
+  // EH work is purely Win64 SEH cleanup funclets (Rust drop glue). Everything
+  // else takes the full Itanium + MSVC error-flag lowering.
+  auto usesCleanupOnly = [&](Function &Func) {
+    switch (Mode) {
+    case LoweringMode::Full:
+      return false;
+    case LoweringMode::CleanupOnly:
+      return true;
+    case LoweringMode::Auto:
+      return isCleanupOnlyFunction(Func);
+    }
+    return false;
+  };
+
+  // The module-level error-state globals are only needed by the full path;
+  // the cleanup-only path emits straight-line code with no error state. Scan
+  // first so a module of pure drop-glue functions does not get the globals
+  // (which would otherwise force downstream tools to model them).
+  bool NeedsFullState = false;
+  bool HasAnyEHWork = false;
   for (Function &Func : Mod) {
-    if (!Func.isDeclaration() && functionHasEHWork(Func)) {
-      NeedsLowering = true;
+    if (Func.isDeclaration() || !functionHasEHWork(Func))
+      continue;
+    HasAnyEHWork = true;
+    if (!usesCleanupOnly(Func)) {
+      NeedsFullState = true;
       break;
     }
   }
-  if (!NeedsLowering)
+  if (!HasAnyEHWork)
     return PreservedAnalyses::all();
 
-  const ErrorState State = getOrCreateErrorState(Mod);
+  // Only materialise the error-state globals when the full path will run.
+  bool HaveState = NeedsFullState;
+  ErrorState State{};
+  if (HaveState)
+    State = getOrCreateErrorState(Mod);
+
   bool Changed = false;
   for (Function &Func : Mod) {
     if (Func.isDeclaration())
       continue;
-    Changed |= lowerFunction(Func, State);
+    if (usesCleanupOnly(Func))
+      Changed |= lowerFunctionCleanupOnly(Func);
+    else
+      Changed |= lowerFunction(Func, State);
   }
 
   // After lowering, none of the EH-runtime declarations or the personality

@@ -39,6 +39,43 @@ cmake .. -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
 ./exception-lower input.ll -o output.bc
 ```
 
+### Lowering modes
+
+The `--mode` flag selects how each function is lowered:
+
+```bash
+./exception-lower input.bc --mode=auto         # default
+./exception-lower input.bc --mode=full
+./exception-lower input.bc --mode=cleanup-only
+```
+
+* `auto` (default) — inspect each function and pick the right path: the
+  lightweight cleanup-only path (below) for functions that contain only
+  cleanup funclets (`cleanuppad` / `cleanupret`) with no catch handlers,
+  and the full error-state lowering for everything else.
+* `full` — always run the full error-flag lowering, even for
+  cleanup-only functions. Useful for forcing uniform output.
+* `cleanup-only` — treat *every* function as cleanup-only: demote all
+  `invoke`s to ordinary `call`s, drop unwind edges, strip funclets and
+  the personality, and delete the now-unreachable EH blocks. No
+  error-state globals are created. Catch handlers, if present, are
+  conservatively discarded.
+
+### Cleanup-only path (Rust Win64 drop glue)
+
+Rust's MSVC-target drop glue (`core::ptr::drop_in_place::<T>`) emits SEH
+funclets purely to run destructors during unwind — there are no catch
+handlers and no thrown values to track. For these functions the full
+error-state machinery is unnecessary: the cleanup-only path simply
+removes the unwind edges and funclet scaffolding, leaving the
+destructor calls on the normal return path. The result needs no
+`@__exclow_*` globals, which keeps the lowered module trivial for
+downstream tools to consume.
+
+`auto` mode detects these functions automatically; a function qualifies
+when it contains `cleanuppad` / `cleanupret` and *no*
+`catchpad` / `catchswitch` / `catchret` / `landingpad` / `resume`.
+
 ## Transformation summary
 
 The pass introduces three module-level `internal global` slots — an in-flight
@@ -101,10 +138,19 @@ terms of those slots:
 ## Testing
 
 The [tests/](tests/) directory contains a small fixture suite plus a
-PowerShell runner. Each fixture is a single C++ translation unit that
-defines `extern "C" unsigned add_one(unsigned)` and embeds expected
-post-lowering shape as `// CHECK:` / `// CHECK-LABEL:` / `// CHECK-NOT:`
-/ `// CHECK-DAG:` comments at the bottom of the source.
+PowerShell runner. Each fixture embeds its expected post-lowering shape
+as `CHECK:` / `CHECK-LABEL:` / `CHECK-NOT:` / `CHECK-DAG:` directives in
+trailing comments. Two fixture formats are supported:
+
+* `*.cpp` — a C++ translation unit (compiled to bitcode first), with
+  `//`-prefixed CHECK directives.
+* `*.ll` — pre-built LLVM text IR (fed straight to the tool, so no
+  compiler is required), with `;`-prefixed CHECK directives. The Rust
+  drop-glue / cleanup-only fixtures use this form so they remain
+  portable across LLVM versions.
+
+A fixture may also declare extra tool arguments via an
+`EXCLOW-ARGS:` directive, e.g. `; EXCLOW-ARGS: --mode=cleanup-only`.
 
 Run the whole suite from the repo root:
 
@@ -124,9 +170,11 @@ and LLVM 18 (Ubuntu 24.04 `llvm-18-dev` / `clang-18`).
 
 The runner, for each fixture:
 
-1. Compiles the source to LLVM bitcode (Windows-MSVC EH by default,
-   `x86_64-pc-linux-gnu` Itanium EH for fixtures named `itanium_*`).
-2. Runs `exception-lower.exe` on the bitcode.
+1. For `*.cpp`, compiles the source to LLVM bitcode (Windows-MSVC EH by
+   default, `x86_64-pc-linux-gnu` Itanium EH for fixtures named
+   `itanium_*`); for `*.ll`, uses the IR directly.
+2. Runs `exception-lower.exe` on the bitcode, forwarding any
+   `EXCLOW-ARGS:` the fixture declares.
 3. Disassembles the lowered bitcode to text IR.
 4. Runs `opt -passes=verify` on the lowered bitcode.
 5. Verifies the lowered text IR satisfies the embedded CHECK directives.

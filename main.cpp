@@ -26,6 +26,23 @@ static cl::opt<std::string> OutputFilename("o",
                                            cl::value_desc("filename"),
                                            cl::Required);
 
+static cl::opt<exclow::LoweringMode> Mode(
+    "mode", cl::desc("Exception-lowering strategy:"),
+    cl::init(exclow::LoweringMode::Auto),
+    cl::values(
+        clEnumValN(exclow::LoweringMode::Auto, "auto",
+                   "Per-function auto-detect (default): pure Win64 SEH "
+                   "cleanup funclets (e.g. Rust drop glue) take the "
+                   "cleanup-only path, everything else the full lowering."),
+        clEnumValN(exclow::LoweringMode::Full, "full",
+                   "Force the full Itanium + MSVC error-flag lowering on "
+                   "every function."),
+        clEnumValN(exclow::LoweringMode::CleanupOnly, "cleanup-only",
+                   "Force the cleanup-only lowering on every function: drop "
+                   "invoke unwind edges, strip funclet bundles, and delete "
+                   "funclet blocks. Catch handlers are conservatively "
+                   "dropped.")));
+
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
   ExitOnError ExitOnErr("exception-lower: ");
@@ -59,7 +76,7 @@ int main(int argc, char **argv) {
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   ModulePassManager MPM;
-  MPM.addPass(exclow::ExceptionLowerPass());
+  MPM.addPass(exclow::ExceptionLowerPass(Mode));
   MPM.run(*M, MAM);
 
   // Write output bitcode.
