@@ -1,0 +1,200 @@
+# Downstream end-to-end integration test.
+#
+# The `.ll` fixtures in tests/ only assert the *shape* of the lowered IR.
+# They do not prove that SAW / Crucible can actually load and symbolically
+# execute it. This workflow closes that gap: it builds exception-lower from
+# the PR source and runs saw-spec-gen's exception-lowering end-to-end proofs
+# (the `cpp_throws` tag — Itanium + MSVC try/catch lowered, then proved by
+# SAW) against the *freshly built* binary, before merge.
+#
+# How the freshly built binary is injected: saw-spec-gen's tool discovery
+# honours the `SAW_SPEC_GEN_EXCEPTION_LOWER` environment variable above all
+# other candidates, so we point it straight at build output — no need to
+# overwrite the binary baked into the CI container / installed by init.ps1.
+#
+# exception-lower is built against LLVM 20 here (not the LLVM 18 used by the
+# main CI matrix) so it matches the clang/SAW LLVM version that produces the
+# bitcode it consumes.
+#
+# Cost control: this runs only on PRs that touch the pass, nightly, and on
+# manual dispatch. Both jobs are `continue-on-error` (non-blocking) until the
+# integration has proven stable — flip that off to make them required.
+#
+# saw-spec-gen and the CI container are tracked at their latest tip / `:latest`
+# tag intentionally: a coordinated change there is fair game. If a downstream
+# change breaks this, fix it in saw-spec-gen.
+
+name: SAW E2E
+
+on:
+  pull_request:
+    paths:
+      - ExceptionLowerPass.cpp
+      - ExceptionLowerPass.h
+      - main.cpp
+      - CMakeLists.txt
+      - .github/workflows/e2e-saw.yml
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC nightly
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-saw-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # ── Linux: reuse saw-spec-gen's pre-baked toolchain container ──────────
+  # The image (ghcr.io/ameliarose802/saw-spec-gen-ci:latest) already ships
+  # SAW 1.5 + solvers + LLVM 20 + pwsh + rustc, so the only work here is
+  # building this small C++ tool and running the proofs.
+  #
+  # NOTE: the container package must be public, or this repo must be granted
+  # read access to it — the default GITHUB_TOKEN does not get cross-repo
+  # package read automatically.
+  linux:
+    name: SAW e2e (Linux, container)
+    runs-on: ubuntu-latest
+    continue-on-error: true # non-blocking until proven stable
+    container:
+      image: ghcr.io/ameliarose802/saw-spec-gen-ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    # Set the toolchain paths explicitly rather than relying on $HOME, which
+    # GitHub overrides to /github/home for container jobs (the image installs
+    # under /root/.saw-spec-gen).
+    env:
+      SAW_SPEC_GEN_LLVM_BIN: /root/.saw-spec-gen/llvm/bin
+      SAW_SPEC_GEN_SAW: /root/.saw-spec-gen/saw/bin/saw
+      SAW_SPEC_GEN_SOLVER_BIN: /root/.saw-spec-gen/saw/bin
+    steps:
+      - name: Checkout exception-lower
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ninja-build
+
+      - name: Build exception-lower (LLVM 20 from image)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR=/root/.saw-spec-gen/llvm/lib/cmake/llvm
+          cmake --build build -j"$(nproc)"
+          ./build/exception-lower --help | head -1
+
+      - name: Checkout saw-spec-gen (latest)
+        uses: actions/checkout@v4
+        with:
+          repository: AmeliaRose802/saw-spec-gen
+          path: saw-spec-gen
+
+      - name: Cache saw-spec-gen Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: saw-spec-gen
+
+      - name: Build saw-spec-gen CLI
+        working-directory: saw-spec-gen
+        run: cargo build --release
+
+      - name: Run cpp_throws proofs against freshly built pass
+        working-directory: saw-spec-gen
+        env:
+          SAW_SPEC_GEN_EXCEPTION_LOWER: ${{ github.workspace }}/build/exception-lower
+        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws
+
+  # ── Windows: no container; install the toolchain via saw-spec-gen init ──
+  # exception-lower is built against an LLVM 20 prebuilt; init.ps1 reuses it
+  # (via SAW_SPEC_GEN_LLVM_BIN) and downloads only SAW + solvers. This is the
+  # only job that exercises the MSVC SEH funclet lowering path end-to-end.
+  windows:
+    name: SAW e2e (Windows)
+    runs-on: windows-latest
+    continue-on-error: true # non-blocking until proven stable
+    steps:
+      - name: Checkout exception-lower
+        uses: actions/checkout@v4
+
+      - name: Cache LLVM 20 (Windows)
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm
+          key: llvm-20.1.6-windows-x64-saw-e2e
+
+      - name: Download LLVM 20.1.6 (Windows)
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $version = "20.1.6"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile llvm.tar.xz -UseBasicParsing
+          7z x llvm.tar.xz -so | 7z x -si -ttar -oC:\llvm-extract
+          $dir = Get-ChildItem C:\llvm-extract -Directory | Select-Object -First 1
+          Move-Item $dir.FullName C:\llvm
+
+      - name: Build exception-lower (LLVM 20)
+        shell: pwsh
+        run: |
+          # The LLVM Windows prebuilt has DIA SDK paths hardcoded from its
+          # original build machine; patch the cmake configs to this runner's
+          # DIA SDK location (same dance as the main CI workflow).
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -property installationPath
+          $diaLib = Join-Path $vsPath "DIA SDK\lib\amd64"
+          if (-not (Test-Path $diaLib)) { Write-Error "DIA SDK not found at $diaLib"; exit 1 }
+          $env:LIB = "$diaLib;$env:LIB"
+
+          $cmakeDir = "C:\llvm\lib\cmake\llvm"
+          $diaLibFwd = $diaLib -replace '\\', '/'
+          Get-ChildItem $cmakeDir -Filter *.cmake | ForEach-Object {
+            $content = Get-Content $_.FullName -Raw
+            if ($content -match 'DIA SDK') {
+              $patched = $content -replace '[A-Z]:[^;"]*DIA SDK[/\\]lib[/\\]amd64', $diaLibFwd
+              Set-Content $_.FullName -Value $patched -NoNewline
+            }
+          }
+
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR=C:\llvm\lib\cmake\llvm
+          cmake --build build --config Release
+          & .\build\Release\exception-lower.exe --help | Select-Object -First 1
+
+      - name: Checkout saw-spec-gen (latest)
+        uses: actions/checkout@v4
+        with:
+          repository: AmeliaRose802/saw-spec-gen
+          path: saw-spec-gen
+
+      - name: Cache saw-spec-gen Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: saw-spec-gen
+
+      - name: Cache SAW toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~\.saw-spec-gen\saw
+          key: saw-1.5-windows-x64
+
+      - name: Install SAW toolchain (saw-spec-gen init)
+        shell: pwsh
+        working-directory: saw-spec-gen
+        env:
+          # Point init.ps1 at our LLVM 20 so it skips the LLVM download and
+          # only fetches SAW + solvers.
+          SAW_SPEC_GEN_LLVM_BIN: C:\llvm\bin
+        run: pwsh scripts/init.ps1 -SkipExceptionLower
+
+      - name: Run cpp_throws proofs against freshly built pass
+        shell: pwsh
+        working-directory: saw-spec-gen
+        env:
+          SAW_SPEC_GEN_LLVM_BIN: C:\llvm\bin
+          SAW_SPEC_GEN_EXCEPTION_LOWER: ${{ github.workspace }}\build\Release\exception-lower.exe
+        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws
