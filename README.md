@@ -5,6 +5,11 @@ explicit error-flag control flow. The resulting bitcode can be consumed by
 downstream tools (symbolic execution engines, verifiers, fuzzers) that do
 not model stack unwinding — for example, [SAW](https://github.com/GaloisInc/saw-script).
 
+This pass is primarily used by
+[saw-spec-gen](https://github.com/AmeliaRose802/saw-spec-gen), which invokes
+it to make exception-handling code tractable for SAW before generating and
+discharging specifications.
+
 The pass handles both major C++ exception-handling ABIs:
 
 * The Itanium exception-handling ABI used on Linux and macOS (the
@@ -113,7 +118,8 @@ terms of those slots:
   require explicit module-global allocation (notably SAW's crucible-llvm)
   must emit `llvm_alloc_global` for `@__exclow_error_flag`,
   `@__exclow_error_typeinfo`, and `@__exclow_error_value`. The
-  `saw-spec-gen` tool does this automatically via `inject_exclow_globals`.
+  [`saw-spec-gen`](https://github.com/AmeliaRose802/saw-spec-gen) tool does
+  this automatically via `inject_exclow_globals`.
 * `_CxxThrowException(value, throw-info)` is rewritten in the same shape
   as `__cxa_throw` — the throw-info pointer goes into the typeinfo slot,
   the value pointer into the value slot, the in-flight flag is set, and
