@@ -119,9 +119,16 @@ jobs:
 
       - name: Run cpp_throws + rust_cleanup proofs against freshly built pass
         working-directory: saw-spec-gen
+        # Use the pwsh shell and call the script directly. Invoking via
+        # `pwsh <script>.ps1 -Tag a,b` uses -File mode, which passes "a,b" as a
+        # single literal string (collapsing the [string[]]$Tag array into one
+        # element that matches no tag). Under `shell: pwsh` the run block is
+        # parsed by PowerShell, so `-Tag cpp_throws,rust_cleanup` becomes a
+        # proper 2-element array.
+        shell: pwsh
         env:
           SAW_SPEC_GEN_EXCEPTION_LOWER: ${{ github.workspace }}/build/exception-lower
-        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws,rust_cleanup
+        run: ./tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws,rust_cleanup
 
   # ── Windows: no container; install the toolchain via saw-spec-gen init ──
   # exception-lower is built against an LLVM 20 prebuilt; init.ps1 reuses it
@@ -215,4 +222,7 @@ jobs:
         env:
           SAW_SPEC_GEN_LLVM_BIN: C:\llvm\bin
           SAW_SPEC_GEN_EXCEPTION_LOWER: ${{ github.workspace }}\build\Release\exception-lower.exe
-        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws,rust_cleanup
+        # Call the script directly (not `pwsh <script>`): the nested `pwsh`
+        # would use -File mode and collapse `cpp_throws,rust_cleanup` into one
+        # literal string. The outer pwsh shell parses the array correctly.
+        run: ./tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws,rust_cleanup
