@@ -8,13 +8,21 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # LLVM's own LLVMConfigVersion.cmake enforces *exact* major.minor matching,
-# so we cannot express "14 or newer" via find_package's version argument.
+# so we cannot express "20 or newer" via find_package's version argument.
 # Locate any LLVM and verify the major version ourselves.
 find_package(LLVM REQUIRED CONFIG)
 
-if(LLVM_VERSION_MAJOR LESS 14)
+# exception-lower must link an LLVM at least as new as the clang/LLVM that
+# produced the bitcode it processes. LLVM's bitcode format only guarantees
+# *backward* compatibility: a newer reader can parse older bitcode, but an
+# older reader parsing newer bitcode is unsupported and silently miscompiles
+# newer constant expressions (e.g. constant GEPs) to `undef`. The published
+# toolchain tracks the clang/LLVM 20 release stream, so require LLVM 20+.
+if(LLVM_VERSION_MAJOR LESS 20)
   message(FATAL_ERROR
-    "exception-lower requires LLVM 14 or newer; found ${LLVM_PACKAGE_VERSION}")
+    "exception-lower requires LLVM 20 or newer (it must be at least as new as "
+    "the clang release stream whose bitcode it processes); "
+    "found ${LLVM_PACKAGE_VERSION}")
 endif()
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
