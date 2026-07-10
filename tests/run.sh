@@ -158,6 +158,7 @@ for f in "${fixtures[@]}"; do
 
     # Extra args (e.g. --mode=cleanup-only) declared by the fixture itself.
     exc_extra="$(get_exclow_args "$f")"
+    exc_extra_arr=()
     read -r -a exc_extra_arr <<<"$exc_extra"
 
     if [[ "$ext" == "ll" ]]; then
@@ -173,7 +174,7 @@ for f in "${fixtures[@]}"; do
         lower_input="$bc"
     fi
 
-    if ! "$EXCLOW_BIN" "$lower_input" "${exc_extra_arr[@]}" -o "$low_bc" 2>&1; then
+    if ! "$EXCLOW_BIN" "$lower_input" ${exc_extra_arr[@]+"${exc_extra_arr[@]}"} -o "$low_bc" 2>&1; then
         echo "  FAIL (exception-lower)"
         total_fail=$((total_fail+1)); failed_names+=("$name (lower)"); continue
     fi
