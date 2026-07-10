@@ -20,7 +20,16 @@ The pass handles both major C++ exception-handling ABIs:
 
 ## Building
 
-Requires LLVM 14 or later and CMake ≥ 3.16.
+Requires LLVM 20 or later and CMake ≥ 3.16. The prebuilt release binaries are
+linked against LLVM 20.1.6.
+
+LLVM's bitcode format is only **backward** compatible: a reader can parse
+bitcode produced by its own or an *older* LLVM, but parsing bitcode from a
+*newer* LLVM is unsupported and silently miscompiles newer constant
+expressions (e.g. constant GEPs) to `undef`. Because exception-lower reads the
+bitcode your compiler emits, it must be linked against an LLVM **at least as
+new as the clang/LLVM that produced the input**. Keep it at or ahead of the
+clang release stream you compile with; the build refuses LLVM older than 20.
 
 ```bash
 mkdir build && cd build
@@ -43,6 +52,23 @@ cmake .. -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
 # The tool also accepts LLVM text IR (.ll) as input.
 ./exception-lower input.ll -o output.bc
 ```
+
+### Bitcode version guard
+
+exception-lower reads the producer record embedded in the input bitcode and
+refuses to run when that bitcode was produced by an LLVM **newer** than the one
+it was built against, rather than best-effort decoding it into corrupt IR:
+
+```
+exception-lower: error: input bitcode was produced by LLVM 21, but this
+exception-lower was built against LLVM 20.
+  ...
+  Rebuild exception-lower against LLVM 21 or newer, or recompile the
+  input with LLVM 20 or older.
+```
+
+Text IR (`.ll`) inputs and bitcode from the same-or-older LLVM are processed
+normally.
 
 ### Lowering modes
 
@@ -171,8 +197,8 @@ On Linux (or any POSIX shell) use the bash companion:
 ```
 
 Both runners share the same fixtures and apply the same embedded
-CHECK directives. Verified against LLVM 20 (Windows binary release)
-and LLVM 18 (Ubuntu 24.04 `llvm-18-dev` / `clang-18`).
+CHECK directives. Verified against LLVM 20.1.6 (the pinned release
+toolchain) and LLVM 20 Homebrew (`llvm@20`).
 
 The runner, for each fixture:
 
