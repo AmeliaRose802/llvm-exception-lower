@@ -6,44 +6,65 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to attach assets to (e.g. v0.3.1)'
+        description: 'Release tag to attach assets to (e.g. v0.4.0)'
         required: true
 
 permissions:
   contents: write
 
+env:
+  # Keep exception-lower's LLVM at or ahead of the clang release stream it is
+  # expected to process. LLVM bitcode is only backward compatible, so linking
+  # an older LLVM than the producing clang silently corrupts IR (constant
+  # expressions decoded as `undef`). The current clang release stream is 20.x.
+  LLVM_VERSION: "20.1.6"
+
 jobs:
   build:
+    name: Build (${{ matrix.label }})
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - label: linux-x64
+            os: ubuntu-22.04
             artifact: exception-lower-linux-x64.tar.gz
-            llvm_version: "18"
-          - os: windows-latest
+            llvm_asset: LLVM-20.1.6-Linux-X64.tar.xz
+          - label: linux-arm64
+            os: ubuntu-22.04-arm
+            artifact: exception-lower-linux-arm64.tar.gz
+            llvm_asset: LLVM-20.1.6-Linux-ARM64.tar.xz
+          - label: macos-x64
+            os: macos-13
+            artifact: exception-lower-macos-x64.tar.gz
+          - label: macos-arm64
+            os: macos-14
+            artifact: exception-lower-macos-arm64.tar.gz
+          - label: windows-x64
+            os: windows-latest
             artifact: exception-lower-windows-x64.zip
-            llvm_version: "18"
+            llvm_asset: clang+llvm-20.1.6-x86_64-pc-windows-msvc.tar.xz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      # ── Linux ─────────────────────────────────────────────────────────
+      # ── Linux: official LLVM 20.1.6 release toolchain ─────────────────
       - name: Install LLVM (Linux)
         if: runner.os == 'Linux'
         run: |
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | sudo tee /etc/apt/trusted.gpg.d/llvm.asc >/dev/null
-          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${{ matrix.llvm_version }} main" \
-            | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update
-          sudo apt-get install -y llvm-${{ matrix.llvm_version }}-dev libzstd-dev zlib1g-dev
+          url="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${{ matrix.llvm_asset }}"
+          echo "Downloading $url"
+          curl -fL "$url" -o llvm.tar.xz
+          mkdir -p "${{ github.workspace }}/llvm"
+          tar -xf llvm.tar.xz -C "${{ github.workspace }}/llvm" --strip-components=1
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
+          LLVM_ROOT="${{ github.workspace }}/llvm"
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_DIR=/usr/lib/llvm-${{ matrix.llvm_version }}/lib/cmake/llvm
-          cmake --build build --config Release -j$(nproc)
+            -DLLVM_DIR="$LLVM_ROOT/lib/cmake/llvm"
+          cmake --build build --config Release -j"$(nproc)"
           strip build/exception-lower
 
       - name: Package (Linux)
@@ -53,21 +74,43 @@ jobs:
           cp -f build/exception-lower pkg/bin/
           tar -czf ${{ matrix.artifact }} -C pkg bin
 
-      # ── Windows ───────────────────────────────────────────────────────
+      # ── macOS: no official LLVM 20.1.x macOS binaries, use Homebrew ───
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install llvm@20
+          echo "LLVM_PREFIX=$(brew --prefix llvm@20)" >> "$GITHUB_ENV"
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="$LLVM_PREFIX/lib/cmake/llvm"
+          cmake --build build --config Release -j"$(sysctl -n hw.ncpu)"
+          strip build/exception-lower
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p pkg/bin
+          cp -f build/exception-lower pkg/bin/
+          tar -czf ${{ matrix.artifact }} -C pkg bin
+
+      # ── Windows: official LLVM 20.1.6 MSVC release ────────────────────
       - name: Cache LLVM (Windows)
         if: runner.os == 'Windows'
         id: cache-llvm-win
         uses: actions/cache@v4
         with:
           path: C:\llvm
-          key: llvm-${{ matrix.llvm_version }}.1.8-windows-x64-v2
+          key: llvm-${{ env.LLVM_VERSION }}-windows-x64
 
       - name: Download LLVM (Windows)
         if: runner.os == 'Windows' && steps.cache-llvm-win.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $version = "${{ matrix.llvm_version }}.1.8"
-          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/clang+llvm-$version-x86_64-pc-windows-msvc.tar.xz"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/${{ matrix.llvm_asset }}"
           Write-Host "Downloading $url"
           Invoke-WebRequest -Uri $url -OutFile llvm.tar.xz -UseBasicParsing
           7z x llvm.tar.xz -so | 7z x -si -ttar -oC:\llvm-extract
