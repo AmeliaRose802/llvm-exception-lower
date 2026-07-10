@@ -3,9 +3,16 @@
 # The `.ll` fixtures in tests/ only assert the *shape* of the lowered IR.
 # They do not prove that SAW / Crucible can actually load and symbolically
 # execute it. This workflow closes that gap: it builds exception-lower from
-# the PR source and runs saw-spec-gen's exception-lowering end-to-end proofs
-# (the `cpp_throws` tag — Itanium + MSVC try/catch lowered, then proved by
-# SAW) against the *freshly built* binary, before merge.
+# the PR source and runs saw-spec-gen's *standard* end-to-end proof suite
+# (`Run-E2ETests.ps1` with no tag filter = the maintained default tag set,
+# which includes the Itanium + MSVC try/catch exception-lowering cases under
+# `cpp_havoc`) against the *freshly built* binary, before merge.
+#
+# We intentionally do NOT pass `-All`: that also runs saw-spec-gen's
+# known-UNKNOWN / research cases (struct_shape, stl_coverage,
+# enum_constraints, sret_slice, proof_markers, ...) which are unstable by
+# design and unrelated to exception lowering. Their pass/fail state is a
+# saw-spec-gen concern, not something this repo should gate on.
 #
 # How the freshly built binary is injected: saw-spec-gen's tool discovery
 # honours the `SAW_SPEC_GEN_EXCEPTION_LOWER` environment variable above all
@@ -113,11 +120,11 @@ jobs:
         working-directory: saw-spec-gen
         run: cargo build --release
 
-      - name: Run cpp_throws proofs against freshly built pass
+      - name: Run standard e2e proof suite against freshly built pass
         working-directory: saw-spec-gen
         env:
           SAW_SPEC_GEN_EXCEPTION_LOWER: ${{ github.workspace }}/build/exception-lower
-        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws
+        run: pwsh tests/e2e/Run-E2ETests.ps1
 
   # ── Windows: no container; install the toolchain via saw-spec-gen init ──
   # exception-lower is built against an LLVM 20 prebuilt; init.ps1 reuses it
@@ -202,10 +209,10 @@ jobs:
           SAW_SPEC_GEN_LLVM_BIN: C:\llvm\bin
         run: pwsh scripts/init.ps1 -SkipExceptionLower
 
-      - name: Run cpp_throws proofs against freshly built pass
+      - name: Run standard e2e proof suite against freshly built pass
         shell: pwsh
         working-directory: saw-spec-gen
         env:
           SAW_SPEC_GEN_LLVM_BIN: C:\llvm\bin
           SAW_SPEC_GEN_EXCEPTION_LOWER: ${{ github.workspace }}\build\Release\exception-lower.exe
-        run: pwsh tests/e2e/Run-E2ETests.ps1 -Tag cpp_throws
+        run: pwsh tests/e2e/Run-E2ETests.ps1
