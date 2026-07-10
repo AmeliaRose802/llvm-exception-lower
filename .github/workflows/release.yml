@@ -1,13 +1,23 @@
 name: Build release binaries
 
 on:
-  release:
-    types: [created]
+  # Auto-cut a versioned release on every merge to main (patch bump).
+  push:
+    branches: [main]
+  # Manual release against an explicit tag.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to attach assets to (e.g. v0.4.0)'
-        required: true
+        description: 'Release tag to build/attach assets to (e.g. v0.4.0). Leave blank to auto patch-bump.'
+        required: false
+  # A release created manually in the GitHub UI.
+  release:
+    types: [created]
+
+# Serialize release runs so two merges can't race to claim the same tag.
+concurrency:
+  group: release-${{ github.workflow }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -20,8 +30,63 @@ env:
   LLVM_VERSION: "20.1.6"
 
 jobs:
+  # ── Resolve (and, for auto/dispatch, create) the release tag ──────────
+  tag:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            # push to main / dispatch without a tag: auto patch-bump the
+            # latest semver-ish v*.*.* tag (start at v0.1.0 if none exist).
+            latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+            if [ -z "$latest" ]; then
+              tag="v0.1.0"
+            else
+              ver=${latest#v}
+              major=${ver%%.*}
+              rest=${ver#*.}
+              minor=${rest%%.*}
+              patch=${rest#*.}
+              patch=$((patch + 1))
+              tag="v${major}.${minor}.${patch}"
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: $tag"
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.resolve.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; attaching assets to it."
+          else
+            echo "Creating release $tag at ${{ github.sha }}"
+            gh release create "$tag" \
+              --target "${{ github.sha }}" \
+              --title "$tag" \
+              --generate-notes
+          fi
+
   build:
     name: Build (${{ matrix.label }})
+    needs: tag
     strategy:
       fail-fast: false
       matrix:
@@ -29,11 +94,9 @@ jobs:
           - label: linux-x64
             os: ubuntu-22.04
             artifact: exception-lower-linux-x64.tar.gz
-            llvm_asset: LLVM-20.1.6-Linux-X64.tar.xz
           - label: linux-arm64
             os: ubuntu-22.04-arm
             artifact: exception-lower-linux-arm64.tar.gz
-            llvm_asset: LLVM-20.1.6-Linux-ARM64.tar.xz
           - label: macos-x64
             os: macos-13
             artifact: exception-lower-macos-x64.tar.gz
@@ -48,20 +111,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── Linux: official LLVM 20.1.6 release toolchain ─────────────────
+      # ── Linux: install the LLVM 20 dev toolchain from apt.llvm.org ────
+      # The official llvm.org release tarballs ship LTO/bitcode static
+      # archives that GNU ld cannot link ("libLLVMCore.a: file format not
+      # recognized"). apt.llvm.org's -dev packages provide normal ELF
+      # libraries and track the latest 20.1.x point release, which
+      # satisfies the LLVM >= 20 requirement the version guard enforces.
       - name: Install LLVM (Linux)
         if: runner.os == 'Linux'
         run: |
-          url="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/${{ matrix.llvm_asset }}"
-          echo "Downloading $url"
-          curl -fL "$url" -o llvm.tar.xz
-          mkdir -p "${{ github.workspace }}/llvm"
-          tar -xf llvm.tar.xz -C "${{ github.workspace }}/llvm" --strip-components=1
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 20
+          sudo apt-get install -y --no-install-recommends llvm-20-dev clang-20
+          echo "LLVM_ROOT=/usr/lib/llvm-20" >> "$GITHUB_ENV"
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
-          LLVM_ROOT="${{ github.workspace }}/llvm"
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR="$LLVM_ROOT/lib/cmake/llvm"
           cmake --build build --config Release -j"$(nproc)"
@@ -159,11 +226,11 @@ jobs:
           Copy-Item build\Release\exception-lower.exe pkg\bin\
           Compress-Archive -Path pkg\bin\* -DestinationPath ${{ matrix.artifact }}
 
-      # ── Upload to release ─────────────────────────────────────────────
+      # ── Upload to the resolved release ────────────────────────────────
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          tag_name: ${{ needs.tag.outputs.tag }}
           files: ${{ matrix.artifact }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
